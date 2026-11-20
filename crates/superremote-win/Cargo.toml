@@ -1,0 +1,22 @@
+[package]
+name = "superremote-win"
+description = "SuperRemote 的 Windows 平台层（Win32 宿主、剪贴板、字体与显示枚举）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "superremote_win"
+path = "src/lib.rs"
+
+[dependencies]
+# 分辨率候选要并入预置档并夹到合法区间，边界与预置值都定义在会话模型里。
+superremote-core = { workspace = true }
+# RDP 宿主把原生子窗口贴进 Iced 父窗口：缩放方向与冻结帧的图片句柄都是
+# iced 的类型，平台层需要同一份定义，不能自己另造一套再转换。
+iced = { workspace = true }
+iced_core = "0.14"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

@@ -1,0 +1,6 @@
+# 默认按文本处理、仓库内统一 LF；二进制资源显式声明，避免 diff/合并尝试解码。
+* text=auto
+*.png binary
+*.ico binary
+*.rgba binary
+*.exe binary

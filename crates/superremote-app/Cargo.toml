@@ -1,0 +1,56 @@
+[package]
+name = "superremote-app"
+description = "SuperRemote 桌面客户端（Rust + Iced）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "SuperRemote"
+path = "src/main.rs"
+
+[lib]
+name = "superremote_app"
+path = "src/lib.rs"
+
+[features]
+# 实测（Win11 / AMD 780M / 150% 缩放 / 1180x720 窗口）：
+#   software(tiny-skia) 空载工作集 29.4MB、私有提交 14MB，exe 3.1MB
+#   gpu(wgpu)          空载工作集 160.4MB、私有提交 172.6MB，exe 7.1MB
+# 成像一致，而"极致轻量"是本项目的硬指标，所以默认走软件渲染。
+# 需要 GPU 加速时：cargo build --release --no-default-features --features gpu
+default = ["software"]
+gpu = ["iced/wgpu"]
+software = ["iced/tiny-skia"]
+
+[dependencies]
+iced = { workspace = true }
+superremote-core = { workspace = true }
+superremote-store = { workspace = true }
+superremote-term = { workspace = true }
+superremote-net = { workspace = true }
+superremote-win = { workspace = true }
+# 自定义控件（右键菜单 `ui/context_menu.rs`）要实现 `Widget`，而 `iced` 顶层刻意
+# 隐藏了 `core`（`mod core {}`），`Widget`/`Tree`/`Layout` 这些类型拿不到。直接依赖
+# `iced_core`，版本与 iced 用的是同一份，不会重复编译——iced 自带的控件也是经
+# `crate::core` 走这条路。
+iced_core = "0.14"
+# 只用来量一次等宽字体的字符步进，终端的列对齐依赖这个数；版本与 iced 内部保持一致，
+# 因此不会重复编译。
+cosmic-text = "0.15"
+# 远端非 UTF-8 主机的字符集解码（GBK / Big5 / Latin-1）。终端设置里选了才走这条路。
+encoding_rs = "0.8"
+# 只用来读一次 Windows 的亮/暗主题偏好（`theme::system_prefers_dark`）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+
+[build-dependencies]
+# 仅 Windows 构建用：把 assets/icon.ico 作为应用图标资源链接进 exe。
+winresource = "0.1"
+
+[dev-dependencies]
+# 无窗口渲染验证：右键菜单/工具提示都是 overlay，只有真的画一遍才能证明它出现。
+iced_test = "0.14"
+png = "0.18"

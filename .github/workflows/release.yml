@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # exe 的版本资源来自 CARGO_PKG_VERSION（build.rs），tag 对不上就等于发了个错版本。
+      - name: 校验 tag 与 Cargo 版本一致
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object { $_.name -eq 'superremote-app' }).version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "tag 是 ${{ github.ref_name }}，但 Cargo.toml 里是 v$version"
+          }
+
+      # 需要 .NET Framework 的 csc.exe（windows-latest 自带）来编译内嵌的 RDP ActiveX 宿主。
+      - name: 构建
+        run: cargo build --release -p superremote-app
+
+      - name: 打包
+        shell: pwsh
+        run: |
+          # 便携单文件：图标、RDP 宿主、全部资源都在 exe 里，解压即用。
+          Compress-Archive -Path target/release/SuperRemote.exe, LICENSE, README.md `
+            -DestinationPath SuperRemote-windows-x64.zip
+
+      - name: 发布
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} SuperRemote-windows-x64.zip `
+            --title "SuperRemote ${{ github.ref_name }}" --generate-notes
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: SuperRemote-windows-x64
+          path: SuperRemote-windows-x64.zip

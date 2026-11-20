@@ -1,0 +1,9 @@
+[package]
+name = "superremote-core"
+description = "SuperRemote 领域层：会话树与标签页管理，不依赖任何 UI 框架"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

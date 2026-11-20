@@ -1,0 +1,20 @@
+[package]
+name = "superremote-store"
+description = "SuperRemote 本地存储：版本化 TOML 文档 + AES-GCM 加密凭据文件"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+getrandom = { workspace = true }
+serde = { workspace = true }
+superremote-core = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

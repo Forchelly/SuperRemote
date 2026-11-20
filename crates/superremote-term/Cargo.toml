@@ -1,0 +1,10 @@
+[package]
+name = "superremote-term"
+description = "SuperRemote 终端内核：ANSI 网格状态机，不依赖任何 UI 框架"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alacritty_terminal = { workspace = true }

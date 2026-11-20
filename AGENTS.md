@@ -1,0 +1,143 @@
+# AGENTS.md
+
+> 本文件是本仓库的协作说明，面向在此工作的 AI 代理与人类贡献者。
+> 动手前先读本文件；本文件与代码不一致时，以代码为准，并在完成改动后更新本文件。
+>
+> 现状基线：`master` 分支；仓库只有一个 Rust + Iced 项目（`crates/*` + `vendor/`）。
+> C# 原版（SimpleRemote 1.2，2019 年后停更）的代码已整体移除，只在需要核对旧行为时查阅上游
+> [beckzhu/SimpleRemote](https://github.com/beckzhu/SimpleRemote)；两套代码不再并存。
+> 本仓库有自动化测试与 clippy 门禁，任何“已验证”的结论都必须写清验证方式。
+
+## 0. 一分钟上手
+
+```bat
+:: 仓库根即 Cargo 工作区
+cargo build --release -p superremote-app          :: 产物 target\release\SuperRemote.exe，约 4.9MB
+cargo test --workspace                    :: 214 个用例，全绿
+cargo clippy --workspace --all-targets -- -D warnings   :: 零告警
+```
+
+- **构建只允许落在默认的 `target/release`**：不要用 `--target-dir` 另开目录（`target/ab`、`target/fix` 这类是历史遗留，别再建）。被 `LNK1104 无法打开文件` 挡住时，先关掉正在运行的 `SuperRemote.exe`（或先问用户），不要绕到新目录。`target/` 永不入库。
+
+- 入口 crate：`crates/superremote-app`（bin 名 `SuperRemote`）；工作区清单：根 `Cargo.toml`。
+- 旧版 C# 的行为可以拿来对照（右键菜单、RDP 属性映射等条款都写着「以旧版为准」），但 `.Compress`、COM/Putty 调用约定、LiteDB 主键格式在 Rust 侧都不存在，不要照搬。
+
+### 0.1 Rust + Iced 工作区
+
+仓库根即 Cargo 工作区（`resolver = "2"`，成员是 `crates/*`），功能面覆盖基础连接流程、RDP 内嵌与
+每连接设置（会话树 / 存储加密 / SSH / Telnet / 终端渲染 / RDP 标签内嵌 / RDP 设置 / 终端设置 / 私钥 / 复制粘贴）。
+连接管理（右键菜单、拖拽移动、后台标签、标签快捷键、独立窗口）**已全部完成**；系统集成（托盘、自启、更新）仍待补。详细说明见根 `README.md`。
+
+```bat
+cargo build --release -p superremote-app               :: 产物 target\release\SuperRemote.exe，约 4.9MB
+cargo test --workspace                        :: 214 个用例，全绿
+cargo clippy --workspace --all-targets -- -D warnings   :: 零告警
+```
+
+- 目录就是标准的 workspace 布局：根 `Cargo.toml` + `crates/*` + `docs/` + `target/`。
+  没有 `src/` 顶层目录，因为这是一个多 crate 工作区而不是单 bin 项目。
+- `cargo test --workspace` 里含两个需要真实 SSH 目标的集成测试（`superremote-net/tests/ssh_live.rs`、
+  `superremote-app/tests/smoke.rs`），缺少 `SUPERREMOTE_SSH_HOST` 等环境变量时会**自动跳过**而不是失败——
+  这也是它能在没有基础设施的机器上永远是绿色的原因。要真跑，按 `README.md` §4 给环境变量。
+- 验证目标是本机 WSL2（Ubuntu 24.04 + OpenSSH 9.6）的 `127.0.0.2`，**可用账号是 `user` 与 `root`**，
+  蓝图里写的 `user1` 在该机上不存在—遇到 `Permission denied` 先确认账号，别去改代码。
+- `debug` 构建里 `App::new()` 认两个环境变量便于手工验证：`SUPERREMOTE_SMOKE_OPEN=1` 启动即打开第一条连接，
+  `SUPERREMOTE_DATA_DIR` 指向临时目录以免污染真实配置。
+- 冒烟用例必须各用各的数据目录（`data_dir(tag)`）。`cargo test` 默认并行，共用一个目录会互相
+  `remove_dir_all`，症状是随机 40s 超时——不是代码慢，是数据被对面删了。
+- 后台任务启动 GUI（`run_in_background`）会让窗口以最小化状态创建（继承 `STARTUPINFO` 的显示方式）。
+  `PrintWindow` 对 Iced 的软件渲染也常拿到上一帧。要截图先 `ShowWindow(SW_RESTORE)` 并强制
+  `RedrawWindow`，否则会对着旧画面得出错误结论。**但不要为了截图置顶、抢焦点或移动用户鼠标**：
+  先征得用户同意；优先用 `iced_test::Simulator` 做无窗口渲染。
+- 分六个 crate：`superremote-core`（会话树、搜索、标签规则，不依赖 UI）、`superremote-store`（TOML 读写与凭据加密）、
+  `superremote-term`（alacritty_terminal 网格 + 物化成 `Frame`）、`superremote-net`（SSH/Telnet 后台线程 + 双向通道）、
+  `superremote-win`（Win32 绑定：窗口/布局/字体/剪贴板/RDP 宿主/目录选择器）、
+  `superremote-app`（Iced 前端，二进制名 `SuperRemote`）。依赖方向严格单向，`superremote-core` 以下没有 UI 概念。
+- 本地存储只有两个文件，都在数据目录。**默认是程序所在目录的 `data`**（便携安装，复制整个安装目录即可带走配置）；用户可以设置页「更改目录」改到任意空目录，选择结果写在程序目录的 `data-location.txt`（程序目录不可写时退到 `%APPDATA%\SimpleRemote2\data-location.txt`）。旧版 AppData 数据在首次按新规则启动时会**复制**到程序目录 `data`，旧目录保留作备份；`SUPERREMOTE_DATA_DIR` 优先级最高（测试靠它隔离真实配置）。恢复默认时会先把默认目录里的旧副本改名成 `*.bak-<时间戳>` 再写入当前数据。设置页的选择器是 `SHBrowseForFolderW`（调用前 `CoInitializeEx`）；切换当场生效：先 `Store::save` 落盘，复制两份文件，写指针，再 `Store::relocate` 并保存；指针写失败不切换，relocate 失败会把指针退回原处。`config.toml` 存版本、会话树、展开状态和 `[security]`；`secrets.toml` 存 `id → hex(nonce||密文||tag)`。**任何凭据都不得写进 config.toml**。写入统一走 `paths::write_atomic`（临时文件 + 改名覆盖）。便携目录里的数据仍是 DPAPI/主口令加密：换 Windows 账户或换机器时只有主口令模式能解开。
+- 口令模型是 DEK/KEK 两层：数据密钥 DEK 加密凭据（AES-256-GCM，AAD 用条目 id），DEK 本身按 `mode` 选择包裹方式——`os` 走 Windows DPAPI（默认，启动不问口令），`password` 走 Argon2id 派生的 KEK（启动必须输口令）。换口令或两种模式互转只重包 DEK，`secrets.toml` 不动，所以「忘记口令」与「凭据不可恢复」只在 password 模式下成立。
+- DPAPI 调用带固定附加熵 `SimpleRemote-dpapi-v1`（`superremote-store/src/keys.rs`）——改这个常量会让已有凭据全部解不开。
+- 读不懂的 `config.toml`/`secrets.toml` 会改名保留为 `*.toml.broken-<unix秒>` 再从空配置启动，并通过 `Notice` 告知界面；但 `schema` 比程序支持的版本更新时**只报错、绝不改写文件**。
+- 界面颜色只有一个来源：`theme::Palette`（`superremote-app/src/theme.rs`）。视图层**禁止**出现 `Color::from_rgb8`，一律写 `theme::palette().text_dim` 这类语义名——亮/暗两套主题能成立全靠这条纪律。唯一的例外是终端画布：`ui/terminal.rs` 的 `to_color()` 把 `superremote_term::Rgb`（终端配色，不跟界面主题走）转成 `Color`，全文件只此一处。当前主题存在进程级 `AtomicBool` 里，`set_mode` 只在三处调用（启动、解锁后、设置页切换）；`Mode::System` 只在 `set_mode` 里读一次注册表，不挂轮询（空载不唤醒）。
+- 下拉弹层（`pick_list`）的样式必须走 `theme::menu_style()`。iced 的默认菜单样式取自 `extended_palette().primary.strong`——灰底 + **亮蓝选中 + 白字** + 直角，与本应用的语义色板不是一套；`pick_list` 要用 `.menu_style(...)` 显式覆盖（`the_dropdown_menu_does_not_fall_back_to_the_default_blue` 守着这条）。右键菜单已经换成自绘面板（`theme::menu_panel()` / `menu_item()`），不再使用 `menu::Menu`，也不再有 `class` 字段。全局 UI 字体由 `main.rs` 的 `iced::daemon(...).default_font(theme::ui_font())` 设为 **Microsoft YaHei UI**（无衬线，Windows 中文界面标准字体）；不要落回 iced 自带的 Fira Sans，也不要给界面混衬线体。**要字重就用 `theme::ui_font_weight(Weight::Semibold)`，不要写 `Font { weight, ..Font::DEFAULT }`**：后者的 family 是通用 `SansSerif`，会绕开 daemon 的默认字体，中文落到另一款回退字体上——分组标题、标签的字形和粗细会跟正文对不上（2026-10-30 真实发生过）。地址、路径、会话状态也走这款 UI 字体；**只有终端画布**使用连接自己选的等宽字体（远端内容）。稿子里树行地址（`.ad`）原本写的是 Consolas，这条已被用户要求覆盖——不要再单独把等宽加回来。图标一律 `ui::icons` 几何绘制，或用微软雅黑自带的 `×` / `+`，禁止再引入 Segoe UI Symbol / emoji 字体充当图标。表单控件正文与字段标签**同号**（`T_CONTROL = T_FIELD_LABEL = 13`）：11.5 的标签在 28px 行高里居中时，基线会比 13px 的输入文字高 1 个物理像素（150% DPI 实测），整页会像「文字高低不齐」。标签靠颜色弱化，不靠字号；标签文字里**不要塞全角空格**做对齐。
+- 界面文案只有一个来源：`i18n::T`（`superremote-app/src/i18n.rs`）。带数字的句子写成 `Lang` 的方法而不是模板——中英语序和单复数规则不同，一个模板总有一边是翻译腔。漏字段是编译错误；`the_two_vocabularies_are_not_copies` 守「复制粘贴后忘改」。当前语言同样存在进程级 `AtomicU8`，切换下一帧生效并写进 `config.toml` 的 `[ui]`。
+- 主题与语言的持久化都在 `config.toml` 的 `[ui]`（`superremote-store/src/document.rs` 的 `UiDoc`），值是字符串而不是枚举：旧版本读到不认识的取值只忽略这一项，不会把整份配置当成损坏文件备份掉。主口令模式下 `Store::open` 拿不到配置，解锁页靠 `Store::peek_ui` 只读地看一眼——它永不报错。
+- 终端画布默认不跟界面主题：默认配色按深底调；用户可以在连接设置里显式选浅底方案（Solarized Light、xterm 白底黑字）。选择高亮与翻页浮层仍用暗色强调色，这是视图层唯一允许绕过当前界面色板的地方。
+- 终端配色是 5 套**内置**方案（`superremote-term::Palette`）：默认深色、Solarized 明暗、Linux 控制台（VGA 表）、xterm（X11 表）。后两套的 16 色取自 https://wiki.gentoo.org/wiki/Terminal_emulator/Colors 的对照表，**改色值要有出处**，`every_palette_keeps_foreground_and_background_apart` 守住前景/背景可分辨。旧版**没有**「导入 PuTTY 配色」：`DatabaseServices.GetPuttyColorlNames()` 读的是它自己的 LiteDB `PuttyColor` 表，README 说的也是「内置多套」——别按导入的前提做功能。
+- 非 UTF-8 字符集必须用**按连接持有**的 `encoding_rs::Decoder` 增量解码（`Terminal::decode_chunk`），不要用 `Encoding::decode` 一次性解。两个真实差别：远端字节是 16ms 一块到的，一个 GBK 汉字跨块时一次性解码会出乱码；`Encoding::decode` 还会**嗅 BOM**，GBK 流里出现 `FF FE` 会整块按 UTF-16LE 解、内容凭空消失。缓冲按 `max_utf8_buffer_length` 上界预留，`CoderResult::OutputFull` 时把没吃的字节重推一次。
+- 右键菜单以旧版为准：树行/列表行 = 连接（含后台/独立窗口）、新建 RDP/SSH/Telnet/目录、剪切/复制/粘贴、重命名/删除；空白处 = 新建到根层、剪贴板有内容时可粘贴。复制是**深拷贝并换新 id**（口令/私钥一并复制到新 id），剪切走 `move_node`（保留 id 与凭据）。`node_actions` / `root_actions` 在 `ui/sidebar.rs`，列表页复用同一份，不要另写一套。
+- **树行双击 = 直接打开**（2026-11-10 加）。Iced 的 `button` 只有 `on_press`、没有双击事件，判定放在 `App::register_click`：同一节点、间隔 ≤ `DOUBLE_CLICK`（400ms）即算命中，命中后清空记录，三连击不会重复开标签。目录不参与（双击目录的语义仍是 `ToggleDirectory`）。新增「打开」入口时不要另写一套计时，复用 `register_click`；改选择逻辑时别把这条悄悄弄丢，`double_clicking_a_row_opens_the_session` 守着。注意连接列表页例外：单击就会回主页详情，第二下已经点不到那一行了，所以列表走右侧「打开」按钮。
+- 图标按钮的悬停提示统一走 `ui::tooltip`（350ms、surface 气泡、1px 描边）：导航、窗口按钮、标签 ✕/`＋`、提示条关闭、口令长按都带文案。新增图标按钮时必须补 tooltip。
+- 图标栏三项是**三个不同目的地**：主页（树 + 选中项详情，标题栏「主页」标签）、连接列表（`Screen::List` + `ui/list.rs`，平铺所有连接，点行回主页详情、右侧「打开」直接建标签）、设置。图标由 `ui/icons.rs` 用几何路径画（主页/列表/齿轮），别再把前两项都接到 `ShowHome`；也别改回符号字体字形。
+- 分组头的小三角、树行的展开箭头都用 `canvas` 几何体绘制，不要用 `▾`/`▸` 字形：字形墨迹在行盒里偏上，放进 15px 圆环会浮在顶部（文字基线不等于视觉中心）。图标按钮的居中同理，见 `ui::button::icon`。
+- 自绘标题栏（终稿 E1+）是「品牌 + 标签条 + 拖拽空白 + 三个 44px 窗口按钮（品牌标只有 20px 高，必须给标题栏行加 `align_y(Center)`，否则会贴在 38px 条的上沿）」：标签条在标题栏里（`ui::workspace::tab_strip`），单行「徽标 + 标题 + ×」，宽度按字符估算（`ui::estimated_width`）封顶 220，活动标签铺 `p.sidebar` + 2px 强调色下划线；「主页」常驻且不可关；`＋` 新建一个**连接标签**（`Screen::NewTab`）：先走与右键「新建 SSH」同一条路径落一个会话节点，页面复用 `ui/editor.rs` 的完整详情编辑器（身份认证 + 协议设置），保存/打开连接都在编辑器里完成。关闭标签时节点若仍是空草稿（host 为空）就删掉，已保存的连接保留。**会话页是整窗的**：图标栏与连接列表都隐藏，终端在底部留 26px 状态条（地址 · 状态 · 网格 · 已接收）；重连 / 全屏 / 断开 / 画面尺寸四档（1280×720、1920×1080、2560×1440、3840×2160，`PaneFit`）挪到标签的右键菜单（`TabAction::{Reconnect, Fullscreen, Disconnect, FitSize}`），切回管理页点「主页」标签。
+- 无边框窗口与自绘标题栏全在 `ui/chrome.rs`（`decorations: false` + 38px 标题条 + 八条缩放热区 + 1px 窗口描边）。两个已经踩过一次的坑：**(a)** `button` 的布局是 `layout::padded`，子元素贴在**左上角**不会居中——窗口按钮的图形必须自己吃满 44×37 的格子再居中，且最小化/最大化用几何体（10×1 横、9×9 描边框）而不是字体符号（实测 `—` 只画得出 4×0.5 逻辑像素，`□` 5.5×5.5）。**(b)** 1px 描边必须是 `with_resize_edges` 的**最上层**，而且必须拆成**四条 1px 细线**（`frame_line`）：整窗大小的带边框容器会让软件后端每帧连透明底一起铺满全屏，实测单这一层就 +15ms（2×），拆线后同样的像素效果几乎不花时间。这层没有 `mouse_area`，理论上不吃事件——但改完这文件要**手工点一次**标题栏按钮确认（命中测试没有像素级用例，`tests/context_menu_visual.rs` 只覆盖菜单/提示）。
+- 八条缩放热区是 `with_resize_edges(content, window)`，**主窗口和独立窗口都要套**（`decorations: false` 把原生 `WS_THICKFRAME` 一起带走了，漏一层那个窗口就只能拖、不能缩）。热区把 `window::Id` 带在 `Message::WindowResize` 里，别退回 `window::latest()`——多窗口下拖独立窗口的边会缩到主窗口头上（`a_detached_window_resizes_from_its_own_edges` 用真实按下事件钉住这条）。标签右键的「画面设为 1920×1080」同理：目标尺寸是**实际像素**，`pane_chrome`（主窗口 38 / 独立窗口 30，终端画面再减 1+26 状态条）与 `rdp_host::logical_rect` 必须同源，再按 `window::scale_factor` 反算成 `window::resize` 收的逻辑尺寸；改尺寸前**无条件**先排一条 `window::maximize(_, false)`——最大化时 Windows 会把宽高覆盖成最大化矩形，不还原就等于没改。winit 只在 `MAXIMIZED` 标志真的翻转时才发 `ShowWindow`，所以普通窗口那条是空操作（不抢焦点），不必为此多问一次 `is_maximized`。
+- **原生 RDP 子窗口永远画在 Iced 之上**，三条后果都必须处理：**(a)** 它会压住缩放热区，所以 `rdp_host::logical_rect` 让画面区按 `ui::RESIZE_EDGE` 缩进左/右/下（全屏不让，那里没有可拖的边），`pane_chrome` 的横向 `2×RESIZE_EDGE` 与它同源；**(b)** Iced 的 overlay 画在父窗口客户区里，会被画面整个盖掉，所以**任何瞬态 UI 都必须是独立窗口而不是页面叠层**。会话菜单：`ContextMenu::popup(f)` 让控件只上报锚点、自己不画 overlay，宿主用 `App::show_menu` 开一个无边框、不可缩放、`skip_taskbar`、`AlwaysOnTop` 的窗口，尺寸就是 `ui::context_menu::panel_size` 算出来的面板（两者同源，小了会裁掉最后几条——`the_menu_window_is_exactly_big_enough_for_its_panel` 用真实布局钉住）；位置 = 父窗口左上角（`rdp_host::window_origin` 走 `GetWindowRect`，句柄来自 `hwnds`）+ 锚点，因为 `Position::Specific` 要的是桌面坐标而锚点是窗口内坐标。菜单收起靠 `window::events()` 的 `Unfocused`（= 用户点了别处），收起时把键盘焦点还给那块画面。提示条同理：`App::update` 是 `apply` + `sync_toast` 两层——`self.status = Some(..)` 散落在三十多处，逐个记得开窗口一定会漏，所以在唯一的出口处比较「status 有没有」与「窗口开没开」；提示条窗口按 `visible: false` 创建、句柄到手后再 `SW_SHOWNA` 显示，**全程不抢键盘焦点**（远端桌面里正打字时，一条「已保存」把焦点带走是事故不是便利），尺寸由 `ui::toast_size` 算——**文字不要定宽**，定宽会让文字块比窗口宽、右边整段被裁（`the_toast_window_is_exactly_big_enough_for_its_message` 用「大窗里量完整包围盒、实际尺寸里再量一次」的方式钉住，不靠同一套算式自证）。**(c)** 标题栏里的图标按钮（窗口三键、标签 ✕、`＋`）的悬停提示只能用 `ui::TITLEBAR_TOOLTIP`（= `Position::Left`）：气泡必须留在 38px 的标题栏带内，`Bottom` 会落到画面里、`Top` 直接跑到窗外。
+- 品牌标是**新 logo 的位图**，不是字体字形：`ui::logo(size)` 在标题栏画 20px、解锁页 64px、致命错误页 48px；像素来自 `src/icon_rgba.rs`（`include_bytes!("../assets/icon-128.rgba")`，由 `assets/icon-256.png` 用 Lanczos 缩放到 128 生成）。窗口图标 / 任务栏用同一份 `ICON_RGBA`，exe 资源仍是 `assets/icon.ico`——换 logo 时两处都要换，再重新生成 `icon-128.rgba`。**不要退回蓝底白字「S」**，也不要打开 iced 的完整 `image` 特性（只要 `image-without-codecs` + 预解码 RGBA，避免把 PNG/JPEG 解码器打进 exe；二进制用 `include_bytes!` 而不是几万行数组，后者在 debug 构建里会额外吃掉数百 MB 内存）。`tests/brand_visual.rs` 逐像素守标题栏与解锁页，`the_window_icon_uses_the_same_transparent_logo_pixels` 守窗口图标的透明圆角。
+- 终端字体下拉只列系统等宽字体：`superremote-app/src/fonts.rs` 用 `EnumFontFamiliesExW` 过 GDI 并按 `lfPitchAndFamily & 0x3` 过滤，结果缓存在进程级 `OnceLock`（每帧重建下拉会重复枚举），`@` 开头的竖排变体与重复族名在这一步去掉。配置里存着但没枚举到的名字必须以「（自定义）」追加到列表末尾——`fields::font_choices` 用**精确相等**判断，因为 `pick_field` 的选中态就是按字符串相等找的，忽略大小写会让下拉显示成别的字体。
+- 默认的软件后端**按脏区呈现**（softbuffer + `damage::diff`），而画面残留类问题（卡片周围灰块、切语言后旧字形、输入时重影）都出在这里。上游 iced 0.14.0 / iced_tiny_skia 0.14.1 是当前最新且未修，所以仓库里 vendored 了一份 `vendor/iced_tiny_skia`（工作区成员，门禁一起跑），只改四处：`Layer::damage` 里 quad 的脏区按 `blur_radius + offset` 扩张（`engine::draw_quad` 的阴影就画在 bounds 之外那一圈）、文本脏区扩 2px、`present()` 先整层比相等、不等但脏区算空时退回整窗重绘、以及 `coalesce()` 把多于 4 块且过绘不超过 3 倍的脏区合成一个包围盒。最后一条是切语言卡顿的根因：`Renderer::draw` 对**每个**脏区都会重新遍历全部图元，整页逐条文本变更产生 96 个小区块时，单帧从 ~17ms 涨到 450ms；合并后 1 块约 17ms。回归用例 `quad_damage_covers_the_shadow_spread`、`many_adjacent_damage_rects_are_coalesced`、`few_damage_rects_are_left_alone`、`sparse_damage_rects_are_not_coalesced`。**升级 iced 时要把这份 diff 重新对一遍**，别让 `[patch.crates-io]` 悄悄失效；GPU 后端不走脏区，但内存代价大，不是默认。
+- 渲染后端是内存的关键开关，实测（Win11 + AMD 780M + 1180x720 窗口，空载工作集）：`software`（tiny-skia，默认）26–29MB / exe 4.93MiB（2026-11-02 重测，含品牌标图片管线与 RDP ActiveX 宿主）；`gpu`（wgpu）约 160MB / exe 8.4MB（2026-10-28 重测 8.38MiB，此前记录 7.1MB）。两者成像一致。exe 体积 2026-11-02 重测为 4.93MiB（2026-10-28 为 4.54MiB；品牌标与 RDP 宿主共多约 200KB）；工作集那组数字**没有**重测，动默认值前按 README §5 口径一起重测。
+- 连接层刻意不做 `async`：每个连接一个线程，界面侧靠 16ms 的 `NetPoll` 订阅 `Hub::drain()` 取事件，`update` 因此保持同步可单测。整条「按键 → 字节 → 远端 → 回显 → 网格」链路在 `superremote-app/tests/smoke.rs` 里能无窗口跑完。**建连本身也在工作线程里**（`telnet::connect`）：`open_telnet` 在 `update` 里被调用，把 DNS 解析与 `connect_timeout` 放在调用线程会直接冻结界面，失败只能以 `NetEvent::Error` 回来。
+- SSH 走 ConPTY + 系统 `ssh.exe`，不是 `russh`（其 `aws-lc-rs`/`ring` 都需要 NASM，本机工具链没有）。附带好处是白拿 `known_hosts`/`ProxyJump`/系统代理；代价是运行环境必须有 `ssh.exe`（Win10 1809+ 自带）。
+- RDP 画面用内置 C# AxHost 宿主（`host/Program.cs`，build.rs 用 `csc.exe` 编译后嵌入 Rust exe）：不走 `.rdp` 文件，宿主设置 `RedirectionWarningDialogVersion=1`（C# 必须用 `VT_UI4`）与 `AuthenticationLevel=0` 后直连，因此 2026-04 的「未签名 `.rdp`」确认框根本不会出现。宿主窗口先出现在屏幕外，`App::poll_rdp` 按 PID + 标题前缀 `SUPERREMOTE|` 找到后 `SetParent` 进标签，标题 `SUPERREMOTE|connected|` / `failed|<msg>` 是状态通道。密码仍由 Rust `CredWrite`、宿主 `CredRead`，不经过命令行或临时文件。宿主声明 Per-Monitor V2，和 Iced 父窗口一致；`rdp_host::PaneLayout` 的几何规则不变。运行前提是 .NET Framework 4.8（Win10/11 自带），构建需要 `csc.exe`。
+- 分辨率三态对应两套呈现方式（`rdp::activex_smart_sizing` → 宿主 `--smart-sizing` → `AdvancedSettings2.SmartSizing`）：**固定分辨率**按 1:1 呈现，标签内容区装不下时由控件自己开水平/垂直滚动条（与旧版一致，旧版从没设过这个属性，默认关），内容区更宽时画面居中；**跟随窗口**与**全屏**开着 `SmartSizing`，画面铺满内容区。改这条要用窗口样式验证：`UIMainClass` 的 `WS_VSCROLL|WS_HSCROLL` 与 `UIContainerClass` 的实际尺寸（本机 PrintWindow/BitBlt 全黑，像素截图不可用）。
+- **RDP 控件版本只表达协议与兼容性，不是 UAC 卡顿根因（2026-11-20 订正）**：`{A0C63C30-…}` = 注册名「version 11」（.NET 类 `MsRdpClient10`），支持 RDP 10 + AVC；`{8B918B82-…}` = 「version 10」（`MsRdpClient9`，旧版 C# 同款），协商 RDP 8.1。登记名 `version N` 比 .NET 类名大 1。`RdpGraphics` 默认仍为 `Compat` = v10，`Modern` = v11；保留默认值只是兼容策略，**不得再宣称 v10 能修 UAC 蓝屏或 v11 必然卡几秒**。落到宿主的参数是 `--rdp-control 10|11`，`SUPERREMOTE_RDP_CONTROL` 优先级最高，只用于兼容性 A/B。`IMsRdpExtendedSettings` 只有 v11 提供，非默认控件下写失败只记日志、不判死连接。`every_graphics_code_round_trips_to_a_distinct_control` 与 `activex_args_carry_the_control_version` 只守配置映射，不证明真实 UAC 性能。
+- **RDP 体验参数分两级，别打包成一个魔术掩码**：`host/Program.cs` 的 `ApplyTrimmedGraphics` 只允许关纯省内存的禁用位（`0x1` 壁纸 / `0x2` 整窗拖动 / `0x4` 菜单动画 / `0x20` 光标阴影），`0x8`(禁主题) 与 `0x40`(禁光标设置) 不碰，`0x100`(`TS_PERF_ENABLE_DESKTOP_COMPOSITION`) **必须置位**，且 `BitmapPersistence` / `CachePersistenceActive` 恒为 1。保留这组约束是为了对齐旧 C# 版参数、避免会话切换退化成全量重绘。**注意：它未被证明是 2026-11-09「弹 UAC 时画面变蓝卡顿」的原因**；那次用新宿主复现后改回原参数现象仍在，但日志里的断连 / 会话仲裁也只是单次观测，不能固定成通用解释。当前该现象按间歇性未决处理，别再沿体验参数碰运气。**原注释的位号是错的**：`0x10` 是 `ENABLE_ENHANCED_GRAPHICS`、`0x40` 才是 `DISABLE_CURSORSETTINGS`、`0x80` 是字体平滑、`0x100` 才是桌面合成，一律以 MSDN `PerformanceFlags` 位表为准。改这块必须手工过 5 个场景：UAC 提权、锁屏/解锁、Ctrl+Alt+End、分辨率切换、多会话切换；`cargo test -p superremote-app rdp_experience_flags_keep_the_graphics_pipeline` 是静态契约门禁，别绕过。
+- **RDP 跨进程窗口的两条防御性约束**：① `rdp_host::window_title` 读的是另一个进程的窗口标题，必须用带超时的 `SendMessageTimeoutW(WM_GETTEXT, 50ms, SMTO_ABORTIFHUNG|SMTO_BLOCK)`，不许退回 `GetWindowTextW`，避免宿主 GUI 线程忙时拖住 Iced。② `host/Program.cs` 的 `HostContext` 每路会话一条 STA 消息循环（各自 `Application.Run(form)`），进程仍共用；一路 COM/窗口调用阻塞时不拖住其它会话。`ControlWindow` 只在主线程收 `WM_COPYDATA`，退出用 `WM_APP_EXIT` 投递；`using System.Threading` 会让 `HostForm` 的 `Timer` 撞成 CS0104，只能用类型别名。跨进程 `SetParent` 仍会隐式附加输入队列；这些是通用稳定性约束，**不是已确认的 UAC 卡顿根因**。
+- **UAC 蓝底卡顿仍是间歇性未决问题（2026-11-20 状态）**：曾观察到同一远端会话第一次 UAC 蓝底数秒、后续毫秒级，也曾观察到 v10 快而 v11 慢；但后续跨 v11/v10/v8 复测，以及 11-20 连续注销新建会话后 v11 + AVC + 硬件帧缓冲下 UAC/Ctrl+Alt+End 均快，证明这些单次 A/B 都不足以定因。体验参数、`OnTick` 宽限、消息循环与超时处理可以保留为通用稳定性改动，但都不是已确认的 UAC 性能修复。`PromptOnSecureDesktop=0` 只是关闭安全桌面的系统安全策略，不是根因修复；设置页只保留中立的显式开关，默认不动用户系统。未再次复现并取得 Winlogon/DWM/RdpCoreTS/ConsentUI 同时间线前，不要改嵌入架构、默认控件或图形参数来碰运气。
+- **排查日志（UAC 蓝屏定位期临时保留）**：`%TEMP%\SimpleRemote2\rdp-host-<pid>.log` 记录宿主创建、连接、窗口消息、COM 状态/慢调用与心跳；`rdp-app.log` 记录 Iced tick、真实 `process.window` 的跨进程 `WM_GETTEXTLENGTH` 探活，以及为空或接近 50ms 超时的真实宿主标题读取。**探活绝不能传 `self.hwnds` 的 Iced 父窗口**（2026-11-19 前曾接错，旧 `probe-ms=0` 不能证明宿主没卡）。判定只限：tick 正常可排除 Iced 主线程停摆；真实宿主 `title-len=0` 或 `probe-ms` 逼近 100 说明宿主 GUI 线程无响应；两边正常仍不能单独断定服务端没发帧，还需系统 ETW/WPR 时间线。日志默认开启、2MB 封顶、写失败忽略；定位完成后降级或移除。
+- 设置模型在 `superremote-core/src/session.rs`（`RdpSettings` / `TerminalSettings`，字段是 `Option`，`None` 表示继承），落盘在 `superremote-store/src/document.rs`（`[defaults.*]` 与每个 session 的 `settings`，枚举存字符串）。解析顺序是单连接 → 全局默认 → 程序默认；新增设置必须同时改这两层与 `rdp.rs` 的 `activex_args` / `host/Program.cs` 映射或 `terminal.rs` 的运行时快照。
+- 终端选择区在 `Terminal` / `TerminalCanvas` 之间传递；复制/粘贴走 `superremote-win/src/clipboard.rs` 的 Win32 `CF_UNICODETEXT`，快捷键是 Ctrl+Shift+C/V，右键直接粘贴。私钥与口令共用 `secrets.toml`，键是 `id#private-key`；`ssh` 启动时把私钥写进 `%TEMP%\SimpleRemote2\ssh-key-<conn>-<后缀>` 交给 `-i`，会话结束由 `superremote_net::discard_secret_file` 覆写后删除。不要把它写进日志。release 是 `panic = "abort"`，异常退出不会跑 `Drop`，所以 `App::with_paths` 每次启动会清掉同一目录下超过 24h 的临时文件（`rdp::clean_stale_temp_files`）。
+- 快捷键集中在 `superremote-app/src/shortcut.rs`，只认**不与 shell 抢键**的组合：`Ctrl+Tab` / `Ctrl+Shift+Tab` 切标签、`Ctrl+1…8` 跳第 N 个、`Ctrl+9` 跳最后、`Ctrl+Shift+W` 关标签。裸 `Ctrl+W` / `Ctrl+K` / `Ctrl+F` 是 shell 的编辑键（删词、删到行尾、右移），一律不许截走——`shell_editing_keys_are_left_to_the_terminal` 守着这条。键盘订阅是常驻的，而 `keyboard::listen` 只送**未被控件捕获**的事件，所以文本框里的按键不会漏进终端。
+- `ContextMenu` 的 `overlay` 在自身菜单没开时**必须把子控件的 overlay 转发出去**：滚动区里每行还挂着 ContextMenu，标签里还挂着 tooltip；直接 `return None` 会让右键状态打开了、画面里却没有菜单（这是一次真实回归）。
+- 标题栏「+」的 `App::new_tab` 只记会话 id；节点与草稿复用右键新建的流程（`create_node` + `ui/editor.rs`），所以两处页面必须是同一套控件。关闭「+」标签会删除 host 仍为空的空草稿；从编辑器打开连接时 `open_session` 会清掉临时标签并换成真实会话标签。
+- 右键菜单是自绘面板：普通 `button` 组成一列，面板负责 1px 描边 + 6px 圆角，`.groups(&[idx...])` 在分组第一条前插发丝线（打开 / 新建 / 剪贴板 / 重命名删除四组）。**`menu::Menu` 的 `width` 默认是 0.0**，它的年代留下过「右键没反应」的假象——所以宽度必须显式算（`ui::estimated_width` + 30，夹 170..340），现在的面板不在 layout 里读窗口宽度，也不依赖它。
+- 菜单悬停必须记在 `MenuState.hovered`，不能依赖按钮自己的 `status`：overlay 在**绘制阶段会重新构造控件**，临时 widget 的 `status` 是空的，读它永远得到 Disabled。行高固定 30px（18px 行盒 + 上下 6px），分隔线 9px，`MenuOverlay::hit_test` 据此算下标的。
+- 菜单收起语义在 overlay 的 `update` 里：左键在面板外按下 → 关；Esc → 关；左键松开 → 关（按钮在松开时发消息，先让它发完）。右键松开**不能**关——那正是打开菜单的那一下。靠近窗口右/下边缘时面板向左/上翻转，保证整块留在窗口里。
+- 包装控件必须转发 `operate`（`ContextMenu`/`Draggable` 都要）：默认实现是空操作，不转发的话内容里的文本/输入框在 `iced_test` 选择器里完全找不到，聚焦类操作也会断。
+- 弹层是否真的出现，只认 `crates/superremote-app/tests/context_menu_visual.rs` 的**像素级**用例：用 `iced_test::Simulator` 渲染真实 `App` 视图，右键/悬停前后逐像素比对（树行、树空白、列表行、设置图标的 tooltip、底部 toast、窗口四边描边）。只断言消息或状态位会漏掉「零宽菜单」这类问题；菜单项点击另有 `ui/context_menu.rs` 的 `clicking_a_menu_item_publishes_its_action` 用真实事件走一遍。`iced_test` 与 `png` 因此是常驻 dev-dependency，不要删。
+- 状态提示是**短暂反馈**，不是常驻状态：`App::status` 渲染为底部居中的 toast（成功 4s、错误 6s 后自动消失，手动 ✕ 也关），订阅只在 `status.is_some()` 时挂 250ms 检查一次。**不要**把提示条塞回侧栏：它曾经看起来像一个填了字的输入框、把搜索行往下推，而且连接列表页没有侧栏、消息直接看不见。
+- 三态复选框的「–」表示**继承默认**，不是未勾选；每行有 tooltip 说明当前状态与下一击的落点（`check_inherit` / `check_on` / `check_off`）。不要把它画成普通空框，也不要把 tooltip 去掉。
+- 右键菜单是自定义控件 `ui/context_menu.rs`：菜单必须以 overlay 形式浮在最上层，而 `App::view(&self)` 是不可变借用，拿不到 `menu::State` 需要的 `&mut`，所以菜单状态放在控件自己的 `Tree` 里（与 `combo_box` 同一套做法）。为此 `superremote-app` 直接依赖了 `iced_core`——`iced` 顶层刻意隐藏 `core`（`mod core {}`），自定义 `Widget` 只能走这条路，不要为此绕道去改 iced 的版本。
+- 树行的三种交互叠在同一个控件上：左键归 `ui/draggable.rs`、右键归 `ui/context_menu.rs`、普通点击归内容里的 `button`。能共存是因为 `button` 在**松开**时才发 `on_press` 且要求光标仍在自己身上——拖到别的行上源行拿不到 click、目标行也没有按下状态。**别把行改成「按下即触发」**，那会把拖拽变成误触。
+- 多窗口走 `iced::daemon` 而不是 `iced::application`：后者的 `ViewFn` **收不到窗口 id**（`Instance::view` 里 `_window` 被丢掉），而本应用要按窗口渲染（主窗口整套管理界面、独立窗口只装一个会话）。daemon 不自动建窗口，主窗口也由 `App::boot` 里的 `window::open` 开出来，和独立窗口走同一条登记路径（`App::windows: HashMap<window::Id, WindowSlot>`）。`window::Settings` **没有 title 字段**，标题由 `App::title(window)` 给。
+- **daemon 不会在窗口关完后自己退出**（iced 0.14 文档原话：*a Daemon will not stop running when all its windows are closed*）。所以 `Message::WindowClosed` 里必须判断「这是不是最后一个窗口」，是的话返回 `iced::exit()`；少了这句，关窗只留一个没有窗口的进程——它占着 exe 不放，用户以为程序已经关了，下一次 `cargo build --release` 还会撞上 `LNK1104 无法打开文件`。判断条件单独抽成 `should_exit_after_close()` 便于单测（`closing_the_last_window_asks_the_process_to_exit`、`a_detached_window_keeps_the_process_alive_after_the_main_window_closes`）。排查这类「文件被占用」时先看 `tasklist | grep SuperRemote`：没有主窗口（`MainWindowHandle` 是 15×15 的 winit 辅助窗）说明就是它。
+- 「在新窗口打开」的 RDP **内嵌进独立窗口**（对齐旧版 `RemoteWinControl`）：`launch_rdp_detached` 先 `window::open` 出独立窗口，再走与标签页同一条 `launch_rdp` 链路（`embed=true`）。贴边几何按宿主分三种：`PaneLayout::Main`（整窗，标题栏以下）、`Detached`（只剩标题条）、`Fullscreen`。
+- **`window::run` 的 Action 在窗口未注册时会被静默丢弃**（`if let Some(window) = window_manager.get_mut(id)` 直接跳过），句柄查询必须挂在 `window::open` 的回执之后（`App::window_ready_task`）——挂在 `Task::batch` 里并发跑会永远等不到 `WindowHandle`。
+- **`App::session_of` 必须同时查标签条与 `WindowSlot::Detached`**：独立窗口的实例不在标签条里，漏掉它 `launch_rdp` 会静默不启动（实例看着「连接中」但 ActiveX 宿主窗口从不出现）。
+- ActiveX 宿主的 `RedirectionWarningDialogVersion` 必须用 **VT_UI4**（C# 里 `object value = (uint)1; set_Property(..., ref value)`）；传 `int` 会 E_FAIL。`AuthenticationLevel=0`、`ClearTextPassword` 等属性和旧版一致。**不要**改回 mstsc + `.rdp`：那会重新触发 2026-04 的未签名文件确认框；也不要靠机器级注册表策略，宿主已经在进程内把确认框关掉。
+- 窗口动作（拖拽/缩放/最小化/最大化/关闭）一律带 `window::Id`，不要再用 `window::latest()` 猜——多窗口下会操作到别的窗口。拿不到 id 时只省掉 `on_press`（`on_press_maybe`），控件类型两路一致，视图树形状不变。独立窗口的标题条（`ui::chrome::detached_bar`）因此和主标题栏共用同一套 44px 窗口按钮图形（`window_button(content, bar_h, …)`，格子高度=所在条高度减 1px）：无边框窗口没有原生标题栏，这三个格子是 Alt+F4 之外唯一的出口。**按钮必须是标题条行的兄弟，不能包在拖拽 `mouse_area` 里**——`mouse_area` 在按下那一刻就吃事件，包住的按钮永远收不到干净的一次点击（`the_detached_window_closes_from_its_own_title_bar` 同时钉住「点了 ×」和「没开始拖」）。
+- 会话右键动作 `TabAction` 带的是**运行实例 `TabId`**，不是标签下标：下标只有主窗口标签条认，而独立窗口没有标签条。两处共用 `ui::workspace::session_actions(tab, detached)`（`detached` 时去掉「在新窗口打开」与「关闭其他标签」），分发在 `App::run_tab_action`，关闭走 `close_instance`（在标签条里=关标签，否则=关它那个窗口）。新增一条动作时只改这一份。
+- 拖拽的移动语义全在 `SessionTree::move_node`（含「目录不能搬进自己下面」的环检查），UI 只发消息。松手落点与「落在空白处」靠 `Status::Ignored` 区分：行控件松手时 `capture_event`，全局 `event::listen_with` 只收没被控件吃掉的松手，于是「落点」与「取消」互斥、不存在先后顺序问题。
+- RDP 口令交给系统凭据管理器时走 `CredWriteW`（`rdp.rs` 的 `platform::write_credential`），目标名 `TERMSRV/<host>`，**不要**退回 `cmdkey` —— 后者把明文口令放在命令行里，同会话的任何进程都能读到。`forget_credentials` 用 `CredDeleteW`，`ERROR_NOT_FOUND` 视为已清除。
+- `NetEvent::Ready` 目前只有 Telnet 会发（TCP 握手成功即成立）。SSH 跑在 `ssh.exe` 里，认证完成是子进程内部状态，进程外拿不到信号，所以 SSH 侧靠 `terminal::Status::is_prompt` 看最后一行是否以 `$`/`#`/`>` 结尾来判断「已连接」。连接流把 `Error` 之后可能紧跟一个 `Exited`，`pump_network` 不允许后者覆盖已经写入的 `Failed`。
+- **拖拽缩放时 `update` 根本不跑**：`window::drag_resize` 最终是 `PostMessageW(WM_NCLBUTTONDOWN)` → `DefWindowProc` 进**系统模态缩放循环**，循环里只有窗口过程会被调用，尺寸事件全部攒到松手才一次性送达。所以「父窗口已按新尺寸重画、子窗口还停在旧矩形」中间那一圈底色就是用户看到的闪烁——靠 `resize_events` → `sync_rdp_layout` 那条链永远治不了。修法：`rdp_host::set_sizing_children(parent, [(child, PaneLayout)])` 给 Iced 顶层窗口装子类化的窗口过程，在 `WM_SIZE` 里用同一个 `logical_rect` 同步 `SetWindowPos` 子窗口（`lParam` 就是新的客户区物理尺寸，不用再查一次 `GetClientRect`）。要点：①原窗口过程存在**窗口属性**（`SetPropW`）而不是我们自己的表里——转发必须无条件成功，锁被占时拿不到原过程就只能丢给 `DefWindowProc`，那会把 winit 的状态打烂；②子窗口名单用 `Mutex` + `try_lock`，抢不到就这一次不贴边（下一个 `WM_SIZE` 会补），绝不阻塞消息循环；③装过就不重复装（属性在 = 已装），`Message::WindowClosed` 里必须 `clear_sizing_window` 摘掉并还原——HWND 值会被系统复用给新窗口，留着旧表项就会对新窗口做坏事。名单每次 `sync_rdp_layout` / `poll_rdp` 整份重给，因此不需要逐处注销。**这只治「画面跟不上窗口边框」那一种滞后**；画面*内部*的擦除闪烁是 mstsc 自己的子窗口（`UIContainerClass`/`IHWindowClass`）在刷背景，那是旧版靠子类化 `IHWindowClass` 吞 `WM_ERASEBKGND` 治的，Rust 侧没有移植，也不该跟这条混为一谈。
+- 终端渲染走 canvas 两遍绘制（合并背景矩形 + 合并文本段）。文本段续写必须同时满足「样式相同 **且** 列号紧接上一段末尾」，只比样式会让断开后的空格把后续字符叠回行首（曾整屏叠字）。`ui/terminal.rs` 的 `row_spans()` 有 4 条分段回归测试守这个不变量。
+- 终端网格按**列号落位**，宽字符的占位格要保留（`CellAttrs::spacer`）；按顺序紧凑追加会让 CJK 之后的整列左移。
+- **视图树形状必须稳定**：Iced 按子元素位置做 diff，`if 条件 { row.push(x) }` 这类条件增删子项会让整行状态错位（skill 原文：conditional wrapping changes tree shape）。条件只能落在 `on_press` 上——没有 `on_press` 的 `button` 会自动汇报 `Disabled`，视觉退灰，位置不动。`editor.rs` 底部操作条里目录的「打开连接」禁用态就是按这条写的。
+- **`view` 必须纯计算**：不要在 view 里解密、读盘、改状态。RDP 面板判断「有没有存凭据」用的是 `Store::has_password`（查内存索引），不是 `password()`（走 AES-GCM）。同理 `App::rows` 在 `update` 里物化。
+- **键盘归属看 `Terminal::accepts_input()`**，不是 `is_live()`：`Connecting` 但已收到输出时也要接管，否则远端停在 `password:` 提示时用户既看不见也输不了（未保存口令的会话会变成死路，`smoke.rs` 有专门的用例守它）。
+- 终端页覆盖规则：**只要 `received > 0` 就显示画面，不用提示页盖住**。`ssh` 的报错和口令提示就在画面里，盖掉等于把唯一的线索藏起来。
+- Iced 0.14 的 API 与网上多数 0.12/0.13 教程不通用（`iced::application(boot, update, view)` 构建器、`Fill/Shrink` 重导出、`Background/Border` 样式结构、`text_input.style` 回调带 `Status` 参数）。改动前以本机 `E:\DevEnvironment\cargo\registry\src\*\iced-0.14.0`、`iced_widget-0.14.2` 源码为准。
+- `view(&self)` 只能借用状态：由树和搜索条件推导出的行必须在 `update` 里物化到 `App::rows`，在 `view` 里临时构造会因生命周期不满足而编译失败。同理，编辑器草稿 `App::draft` 只在 `ApplyDraft` 时写回领域模型，避免每次按键都改树。
+- 落盘用「脏标记 + 1.2s 自动保存」：`App::subscription` 只在 `Store::is_dirty()` 为真时才挂 `iced::time::every`，空闲状态不产生任何唤醒。
+- **按钮只有一个来源**：带文字的按钮一律走 `ui::button::{primary, secondary, danger}`（同一套 `[6, 14]` 内边距、12px 字、**1px 描边、6px 圆角**；禁用态传 `None`，不要用 `space()` 顶替）；图标按钮（窗口控件、标签 ✕/`＋`、导航图标）一律走 `ui::button::icon`，它负责把内容吃满格子并双向居中。视图层**不要直接写 `button(...)`**——树行、标签页、分段选择器是结构性控件，不在此列。`every_action_button_shares_the_same_geometry` 钉住三种层级共用同一条描边与圆角。
+- **版面基准线**：`ui::PANE_PAD = [14, 28]`（详情页上/左右内边距）与 `ui::FORM_W = 500` = `LABEL_W 88` + `LABEL_GAP 12` + `FIELD_W 400`。详情页里控件**统一 400 宽、贴着左基准线排**，右侧留白随窗口变宽而长大，不再有「内容列 760/1180 + 居中」那套逻辑（`CONTENT_MAX`/`content_max` 已删）。分组头是 15px 细环 + 标题 + 通栏底线；勾选框与分组级按钮缩进 100（= 88 + 12）；页面级按钮固定在底部 52px 操作条。设置页是另一套：**窄屏（内容区 < `ui::WIDE_MIN` 1200）单列铺满；宽屏两列、左对齐**（左列 340、右列吃满、内容上限 1280），页头和卡片都从侧栏右侧 16px 起排，不要居中。卡片说明固定两行高、设置页标签列 100px 且不换行——中英文行数不同不能推动后面的卡片。
+- 分组头按稿子排版：标题上方 4、下方 8 再画底线，分组体与底线之间 12；标题容器的 1.5px 底边只负责让文字墨迹与 15px 圆环同心，不能把 8px 也塞进去（会推高 3px）。
+- **详情页（连接信息 / 远程桌面设置 / 终端设置）必须在默认窗口 1180×760 下一屏放下、不出滚动条。** 终稿的行距是 8（稿子画 10；标签升到 13px 后为保持一屏又压了 1px）、字段行高约 28、描述框 74；密码的「清除 / 长按显示」并进密码那一行，协议与端口合并在地址行。加字段前先量：无窗口渲染一张 1180×760，扫右边缘有没有滚动条（滚动条颜色 `(184,184,204)`，出现在距右边 20px 处）。SSH 的终端设置 9 项分两列排，单列会多出半屏。
+- 设置页版式必须与语言无关：说明区固定两行高（`HINT_H`），字段标签用 `pick_field_wide` / `field_secure_wide`（100px、nowrap）；`tests/settings_layout.rs` 在窄/宽/超宽三种尺寸下逐项对比中英文 y 坐标，任何由文案行数撑出来的高度都会让它红。
+- **窗口变宽时详情页的表单仍是 500 宽**（不拉伸、不居中），设置页在宽屏切为左对齐双列、右列跟着变宽；`App::boot` 里要登记主窗口初始尺寸，否则最大化启动会先按 1180 排一帧。
+- 下拉选项的文案里**不要出现括号**：`inherit_with` 的「继承默认（…）」只用在 400 宽的详情控件里；设置页的窄列用 `builtin_with` 的「内置 · …」短式，再长就会把下拉箭头挤出控件。优先用短名（混合 / xterm / Windows / DEL / 标准 / rxvt），解释写在代码注释里，不塞进选项。
+- 树行与标签的文字不会被自动截断：Iced 0.14 既没有文本测量接口也没有 ellipsis 选项，`Wrapping::None` 只保证不换行，超宽的部分连省略号都没有、直接被外层裁掉（曾把地址栏裁成 `0.0.0.9:23`）。两处共用 `ui::fit()` / `ui::estimated_width()` 按字符估宽手动截断，并给地址列定死 92px 右对齐。
+- 本机 `E:\DevEnvironment\cargo\bin\*.exe` 全是 rustup 的**符号链接**，Windows 现在拒绝解析（`os error 448` / `无法遍历该路径，因为它包含不受信任的装入点`）。绕法是直接调工具链里的真实 exe，并把 `rustc`/`rustdoc` 也指过去：
+  `set RUSTC=E:\DevEnvironment\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe`、`set RUSTDOC=...\rustdoc.exe`，然后用 `...\bin\cargo.exe`（clippy 需再把该目录加进 `PATH`）。
+- 桌面截图在这台机器上可能整屏发黑（会话被锁定或 DWM 不合成），此时 `PrintWindow`/`StretchBlt` 都只能拿到黑图。要核对排版改用 Iced 自带的 `iced_test::Simulator` 无窗口渲染成 PNG（再加 `png` 读回来逐行量像素区间），比对着窗口猜坐标可靠得多；`tests/context_menu_visual.rs` 是这套做法的常驻范例，临时用例验完要删。
+
+## 1. 仓库与发行
+
+- **仓库**：`https://github.com/Forchelly/SuperRemote`（工作区 `Cargo.toml` 的 `repository` 与 README 徽标同源）。产品名、exe 名、crate 前缀都是 `SuperRemote` / `superremote-`。
+- **只有一份代码**：`crates/*` + `vendor/iced_tiny_skia`。旧 C# 版（`legacy/`、`MetroApp.sln`、`.Compress` 资源、LiteDB）已从仓库移除，不要在仓库里重建，也不要照搬它的工程结构（见第 0 节）。
+- **不进版本库的东西**：`target/`（`debug/`、`release/`、`dist/`、增量与测试数据全在里面）、`.agents/`、`.workbuddy/` 的日志与 GUI 验证产物。完整清单见 `.gitignore`；提交前确认 `git status` 里没有 `target/` 下的文件。
+- **发版**：改 `Cargo.toml` 的 `[workspace.package] version` → 提交 → 打同名 tag（`v2.0.0`）→ 推送 tag。`.github/workflows/release.yml` 会在 `windows-latest` 上构建，校验 tag 与 Cargo 版本一致，产出 `SuperRemote-windows-x64.zip`（exe + LICENSE + README）并挂到 GitHub Release；`workflow_dispatch` 只构建并上传 artifact，不发 Release。
+- **CI**：`.github/workflows/ci.yml` 在 push `master` 与 PR 上跑 `cargo clippy --workspace --all-targets -- -D warnings` 和 `cargo test --workspace`。没配 `SUPERREMOTE_SSH_*` 时集成用例自动跳过，所以不需要额外机密。
+- 构建与测试都是 Windows-only（`windows-sys`、`csc.exe` 编 RDP 宿主、GDI 字体枚举），不要为跨平台去改依赖结构。

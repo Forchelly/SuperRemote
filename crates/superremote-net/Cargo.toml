@@ -1,0 +1,26 @@
+[package]
+name = "superremote-net"
+description = "SuperRemote 连接层：SSH（ConPTY + OpenSSH 客户端）与 Telnet（原生 TCP）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util"] }
+thiserror = { workspace = true }
+superremote-term = { workspace = true }
+# 只借用它的 Windows ConPTY 实现（tty 模块），网格与解析仍归 superremote-term。
+alacritty_terminal = { workspace = true, default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

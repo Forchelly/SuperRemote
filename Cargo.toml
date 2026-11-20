@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+# 用 glob：新增 crate 只要放进 crates/ 就自动成为成员，不用再回来改这里。
+# vendor/ 里的 iced_tiny_skia 是打过脏区补丁的本地副本（见文件末尾的 [patch]），
+# 纳入工作区是为了让它的回归用例进默认门禁。
+members = ["crates/*", "vendor/iced_tiny_skia"]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Forchelly/SuperRemote"
+
+# 软件后端（默认渲染器）的窗口呈现按「脏区」绘制，而 iced_tiny_skia 0.14.1 的
+# 脏区算法有两处漏算：阴影只按 quad 边界 +1px 扩，实际会散开 blur_radius；
+# 文本用未扩边的 ink bounds。漏掉的像素不会被重画，表现为「灰暗块」「切语言后
+# 旧字形残留」「输入时重影」。上游 0.14.0/0.14.1 是最新版且没修，所以这里接管
+# 一份本地副本（vendor/iced_tiny_skia），只动 layer.rs 的 damage 与
+# compositor.rs 的呈现判据。升级 iced 时要把这份 diff 重新对一遍。
+[patch.crates-io]
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
+
+[workspace.dependencies]
+superremote-core = { path = "crates/superremote-core" }
+superremote-store = { path = "crates/superremote-store" }
+superremote-term = { path = "crates/superremote-term" }
+superremote-net = { path = "crates/superremote-net" }
+superremote-win = { path = "crates/superremote-win" }
+
+# 终端网格与转义序列解析（阶段三）。版本以 crates.io 当前稳定版为准，API 已核对过源码。
+alacritty_terminal = { version = "0.26", default-features = false }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "getrandom"] }
+# 只取 alloc：省掉 password-hash 与 PHC 字符串编码，本项目只需要定长派生密钥。
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+getrandom = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "1.1"
+zeroize = { version = "1.9", features = ["alloc"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    # RDP 口令直接写进系统凭据管理器，避免像 `cmdkey` 那样把明文塞进命令行。
+    "Win32_Security_Credentials",
+    # 主题跟随系统：读 HKCU 的 AppsUseLightTheme。
+    "Win32_System_Registry",
+    # 自绘标题栏、无边框窗口缩放，以及把 mstsc 会话窗口嵌进标签页。
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    # 宿主进程绑进「主进程退出即终止」的作业对象，避免崩溃后留下孤儿宿主。
+    "Win32_System_JobObjects",
+    # 分辨率下拉枚举显卡上报的显示模式（EnumDisplaySettingsW / DEVMODEW）。
+    "Win32_Graphics_Gdi",
+    # 设置页选择数据目录：SHBrowseForFolderW 与 PIDL 释放。
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_System_Com",
+] }
+
+# crisp：像素对齐（文字不发虚）；tokio：Task/Subscription 的执行器，
+# 阶段三的 SSH 长连接直接跑在这上面，不需要再引一层运行时。
+# 渲染后端由 superremote-app 的 gpu / software 特性决定，见 crates/superremote-app/Cargo.toml。
+iced = { version = "0.14", default-features = false, features = [
+    "crisp",
+    "tokio",
+    # 终端网格用 canvas 画：几十个合并后的矩形 + 若干段文本，比逐格控件轻得多。
+    "canvas",
+    # 图片控件承载终端截图（`ui::workspace`）；品牌标已改为画布矢量绘制
+    # （`ui::logo`）。只开控件与渲染管线，不加 PNG/JPEG 解码器。
+    "image-without-codecs",
+] }
+
+# 单文件分发：全量 LTO、去符号、去溢出检查。
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+debug = false
+panic = "abort"
+overflow-checks = false
+
+# 体积档位：`cargo build --profile dist`，用来对比 opt-level="s" 省下的体积与代价。
+[profile.dist]
+inherits = "release"
+opt-level = "s"
+
+# debug 也保留可交付的流畅度：wgpu/alacritty_terminal 这类原生栈在 -O0 下不可用。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
