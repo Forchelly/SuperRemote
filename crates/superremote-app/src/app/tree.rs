@@ -372,6 +372,134 @@ impl App {
         }
     }
 
+    /// 树 / 连接列表的键盘导航，`handle_key` 在没有终端的画面上认领。
+    ///
+    /// 树按 `self.rows`（与画面同一份物化行）移动选中；列表页没有物化状态，
+    /// 每次按键按 `ui::list` 的显示顺序（先序、忽略目录展开）现算一遍——
+    /// 几百个条目的遍历对一次按键无所谓，为此养一份常驻状态才是成本。
+    pub(super) fn apply_nav(&mut self, nav: shortcut::Nav) -> Task<Message> {
+        match self.screen {
+            Screen::Remote if self.show_home => self.nav_tree(nav),
+            Screen::List => self.nav_list(nav),
+            _ => Task::none(),
+        }
+    }
+
+    fn nav_tree(&mut self, nav: shortcut::Nav) -> Task<Message> {
+        let position = self
+            .rows
+            .iter()
+            .position(|row| self.selected.as_deref().is_some_and(|id| row.id() == id));
+
+        match nav {
+            shortcut::Nav::Up | shortcut::Nav::Down => {
+                if self.rows.is_empty() {
+                    return Task::none();
+                }
+                let index = match position {
+                    None => 0,
+                    Some(index) if nav == shortcut::Nav::Down => {
+                        (index + 1).min(self.rows.len() - 1)
+                    }
+                    Some(index) => index.saturating_sub(1),
+                };
+                if let Some(id) = self.rows.get(index).map(|row| row.id().clone()) {
+                    // 与鼠标单击同一套选中：详情面板随 selected 走。
+                    // ponytail: 不做自动滚动（iced 0.14 没有现成的 scroll-into-view），
+                    // 树特别深时选中行可能在视口外，用户滚一下即可。
+                    self.load_draft_into_editor(&id);
+                }
+                Task::none()
+            }
+            // 连接 = 右键「打开」那条路（按连接自己的偏好决定落在哪）；
+            // 目录 = 展开/折叠，与双击目录的语义一致。
+            shortcut::Nav::Open => match position.and_then(|index| self.rows.get(index)) {
+                Some(TreeRow::Directory { id, .. }) => {
+                    let id = id.clone();
+                    self.update(Message::ToggleDirectory(id))
+                }
+                Some(TreeRow::Session { id, .. }) => {
+                    let id = id.clone();
+                    self.run_tree_action(TreeAction::Open(id))
+                }
+                None => Task::none(),
+            },
+            // → 只展开收着的、← 只折叠开着的；连接行上不动，与资源管理器的
+            // 手感一致（在收着的目录上按 ← 不该有别的副作用）。
+            shortcut::Nav::Expand | shortcut::Nav::Collapse => {
+                let Some(row) = position.and_then(|index| self.rows.get(index)) else {
+                    return Task::none();
+                };
+                let TreeRow::Directory { id, expanded, .. } = row else {
+                    return Task::none();
+                };
+                if *expanded == matches!(nav, shortcut::Nav::Expand) {
+                    return Task::none();
+                }
+                let id = id.clone();
+                self.update(Message::ToggleDirectory(id))
+            }
+            // 与右键「重命名」同一条路径：跳到编辑页并把光标送进名称框。
+            shortcut::Nav::Rename => match self.selected.clone() {
+                Some(id) => self.run_tree_action(TreeAction::Rename(id)),
+                None => Task::none(),
+            },
+            // 与右键「删除」同一条路径，包括删除目录即删除整棵子树的既有语义。
+            shortcut::Nav::Delete => match self.selected.clone() {
+                Some(_) => self.update(Message::DeleteSelected),
+                None => Task::none(),
+            },
+        }
+    }
+
+    fn nav_list(&mut self, nav: shortcut::Nav) -> Task<Message> {
+        let Some(tree) = self.tree() else {
+            return Task::none();
+        };
+        let ids = tree.session_ids(&self.search);
+        let position = self
+            .selected
+            .as_deref()
+            .and_then(|id| ids.iter().position(|candidate| candidate == id));
+
+        match nav {
+            shortcut::Nav::Up | shortcut::Nav::Down => {
+                if ids.is_empty() {
+                    return Task::none();
+                }
+                let index = match position {
+                    None => 0,
+                    Some(index) if nav == shortcut::Nav::Down => (index + 1).min(ids.len() - 1),
+                    Some(index) => index.saturating_sub(1),
+                };
+                if let Some(id) = ids.get(index).cloned() {
+                    // 只改选中不跳页：↑↓ 是在列表里找人的动作，
+                    // 每按一下就拽回主页详情页会把人从列表上赶走。
+                    self.load_draft_into_editor(&id);
+                }
+                Task::none()
+            }
+            // 列表页的 Enter 对齐右侧「打开」按钮而不是行点击：到这一页的
+            // 键盘用户就是来找人打开的，拐经主页详情页再按一次没有道理。
+            shortcut::Nav::Open => match position.and_then(|index| ids.get(index)).cloned() {
+                Some(id) => self.run_tree_action(TreeAction::Open(id)),
+                None => Task::none(),
+            },
+            shortcut::Nav::Rename => match position.and_then(|index| ids.get(index)).cloned() {
+                Some(id) => self.run_tree_action(TreeAction::Rename(id)),
+                None => Task::none(),
+            },
+            // 只删列表里的选中项：selected 可能是主页树上选中的目录，
+            // 列表页的 Delete 不该越过页面语义去删整棵子树。
+            shortcut::Nav::Delete => match position {
+                Some(_) => self.update(Message::DeleteSelected),
+                None => Task::none(),
+            },
+            // ←→ 在平铺列表上没有语义。
+            shortcut::Nav::Expand | shortcut::Nav::Collapse => Task::none(),
+        }
+    }
+
     /// 粘贴剪贴板里的节点。
     ///
     /// 剪切走 `move_node`（保留 id，凭据不用搬）；复制做一次深拷贝并换新 id，

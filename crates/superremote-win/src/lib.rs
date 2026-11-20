@@ -15,5 +15,6 @@ pub mod fonts;
 pub mod icon_rgba;
 pub mod layout;
 pub mod rdp_host;
+pub mod single_instance;
 pub mod sys_tuning;
 pub mod system;

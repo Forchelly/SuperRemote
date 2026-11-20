@@ -22,7 +22,7 @@ use superremote_core::session::{
 };
 use superremote_core::tab::{Tab, TabId, TabManager};
 use superremote_net::{Hub, NetEvent, Target};
-use superremote_store::{DataPaths, KeyMode, OpenError, Opened, Store};
+use superremote_store::{DataPaths, KeyMode, OpenError, Opened, Store, StoreError};
 
 use crate::i18n::{self, Lang};
 use crate::rdp::{HostRef, RdpProcess};
@@ -850,6 +850,8 @@ impl App {
                 self.screen = Screen::Remote;
                 self.show_home = false;
                 self.selection = None;
+                // 它之前可能是后台标签，帧攒着没物化；切到面前先补上。
+                self.refresh_active_frame();
                 self.sync_rdp_layout();
                 self.focus_active_rdp();
             }
@@ -864,6 +866,9 @@ impl App {
                 if self.tabs.is_empty() {
                     self.go_sessions();
                 }
+                // 关掉的可能是活动标签，邻居被自动激活——它原来在后台，
+                // 帧可能攒着没物化。
+                self.refresh_active_frame();
                 self.sync_rdp_layout();
                 return self.leave_fullscreen_if_gone();
             }
@@ -1437,7 +1442,7 @@ impl App {
                 terminal.conn = Some(conn);
                 terminal.status = ConnStatus::Connecting;
             }
-            Err(err) => terminal.status = ConnStatus::Failed(err.to_string()),
+            Err(err) => terminal.status = ConnStatus::Failed(net_error_text(&err)),
         }
 
         let (window, opened) = window::open(detached_window_settings(session.window));
@@ -1549,7 +1554,7 @@ impl App {
                 terminal.conn = Some(conn);
                 terminal.status = ConnStatus::Connecting;
             }
-            Err(err) => terminal.status = ConnStatus::Failed(err.to_string()),
+            Err(err) => terminal.status = ConnStatus::Failed(net_error_text(&err)),
         }
 
         Task::none()
@@ -1657,18 +1662,28 @@ impl App {
                 .map(|(instance, _)| *instance);
 
             let Some(instance) = instance else { continue };
+            // 可见性要在拿 `terminals` 的可变借用之前判定：它要读标签条与窗口表。
+            let visible = self.is_instance_visible(instance);
             let Some(terminal) = self.terminals.get_mut(&instance) else {
                 continue;
             };
 
             match event {
                 NetEvent::Data(bytes) => {
-                    terminal.feed(&bytes);
+                    // 后台标签只喂网格不物化 Frame：整屏物化只服务渲染，
+                    // 四个标签跑 `tail -f` 时就是每 16ms 四次全屏分配。
+                    if visible {
+                        terminal.feed(&bytes);
+                    } else {
+                        terminal.feed_background(&bytes);
+                    }
                     // 有新输出时把光标立刻点亮，闪烁相位从这一刻重新计时。
                     self.blink_on = true;
                 }
                 NetEvent::Ready => terminal.mark_ready(),
-                NetEvent::Error(message) => terminal.status = ConnStatus::Failed(message),
+                NetEvent::Error(err) => {
+                    terminal.status = ConnStatus::Failed(net_error_text(&err));
+                }
                 // 已经失败过的会话不要被随后的 `Exited` 覆盖成「正常断开」：
                 // 连接层常在报错之后紧跟一个退出事件，覆盖掉就等于把失败原因藏起来。
                 NetEvent::Exited(code) => {
@@ -1678,15 +1693,30 @@ impl App {
                 }
             }
         }
+
+        // 队列顶到过上限：中间一段输出被丢了，给一条提示解释画面里的缺口。
+        if self.hub.take_overflowed() {
+            self.status = Some(Status::error(i18n::lang().net_overflow()));
+        }
     }
 
-    /// 键盘事件的唯一入口：先让界面快捷键认领，认领不到再交给终端。
+    /// 键盘事件的唯一入口：界面快捷键 → 树/列表导航 → 终端，按这个顺序认领。
     ///
     /// 顺序不能反。`encode_key` 对 `Named` 键**不看** `ctrl`（`Tab` 一律编成 `\t`），
     /// 先发给终端的话，按 `Ctrl+Tab` 会在 shell 里凭空多出一个制表符。
+    /// 导航键只在画面里没有终端的页面认领：主页（`show_home`）与连接列表页；
+    /// 终端页里的裸方向键属于远端 shell。
     fn handle_key(&mut self, event: keyboard::Event) -> Task<Message> {
         if let Some(shortcut) = shortcut::resolve(&event) {
             return self.apply_shortcut(shortcut);
+        }
+
+        let on_navigator =
+            (self.screen == Screen::Remote && self.show_home) || self.screen == Screen::List;
+        if on_navigator {
+            if let Some(nav) = shortcut::resolve_nav(&event) {
+                return self.apply_nav(nav);
+            }
         }
 
         self.send_key(event);
@@ -2244,8 +2274,28 @@ impl App {
         };
 
         if let Some(err) = failure {
-            self.status = Some(Status::error(i18n::lang().save_failed(&err.to_string())));
+            // 外部修改冲突有自己的说法：不套「保存失败：io 原因」的模板，
+            // 用户要的是「没保存 + 该怎么办」，不是技术细节。
+            let message = if matches!(err, StoreError::ExternalModified(_)) {
+                i18n::lang().data_file_changed().to_owned()
+            } else {
+                i18n::lang().save_failed(&err.to_string())
+            };
+            self.status = Some(Status::error(message));
         }
+    }
+}
+
+/// 连接层错误 → 状态条文案：原文 + 按 `ErrorKind` 的可操作建议（建议在 i18n，
+/// 原文在 net 层生成）。「os error 10061」对用户没有任何指向性，
+/// 「目标拒绝连接：端口没开或服务未启动」才有。
+fn net_error_text(err: &superremote_net::NetError) -> String {
+    let hint = err
+        .error_kind()
+        .and_then(|kind| i18n::lang().net_error_hint(kind));
+    match hint {
+        Some(hint) => format!("{err}（{hint}）"),
+        None => err.to_string(),
     }
 }
 
@@ -3265,6 +3315,186 @@ mod tests {
         send(&mut app, Message::TreeAction(TreeAction::Open(id)));
         assert_eq!(app.screen, Screen::Remote, "从列表打开要把 screen 摘出来");
         assert_eq!(app.tabs.len(), 1);
+    }
+
+    /// 构造一次「裸按键」走完整的 `handle_key` 管线，导航认领与否都在里面判定。
+    fn nav_key(named: iced::keyboard::Key) -> Message {
+        Message::KeyInput(Box::new(iced::keyboard::Event::KeyPressed {
+            key: named.clone(),
+            modified_key: named,
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::ArrowDown),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::NONE,
+            text: None,
+            repeat: false,
+        }))
+    }
+
+    fn arrow(named: iced::keyboard::key::Named) -> Message {
+        nav_key(iced::keyboard::Key::Named(named))
+    }
+
+    /// 主页上的 ↑↓ 沿树行移动选中；没有选中时 ↓ 从第一行开始。
+    #[test]
+    fn arrow_keys_walk_the_tree_rows() {
+        let temp = TempDir::new("nav-tree");
+        let mut app = App::with_paths(temp.paths());
+
+        send(&mut app, Message::NewSession(SessionKind::Ssh));
+        fill(&mut app, "Web-01", "10.20.1.11", "22", "ops");
+        send(&mut app, Message::ApplyDraft);
+        let first = app.selected.clone().expect("新建后应处于选中态");
+
+        send(&mut app, Message::NewSession(SessionKind::Ssh));
+        fill(&mut app, "Web-02", "10.20.1.12", "22", "ops");
+        send(&mut app, Message::ApplyDraft);
+        let second = app.selected.clone().expect("第二条也应处于选中态");
+        assert_eq!(app.rows.len(), 2, "两条根层连接应是两行");
+
+        // 清空选中后再按 ↓：应落在第一行，而不是维持原位。
+        app.selected = None;
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowDown));
+        assert_eq!(app.selected.as_deref(), Some(first.as_str()));
+
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowDown));
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(second.as_str()),
+            "再按 ↓ 到第二行"
+        );
+
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowUp));
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(first.as_str()),
+            "↑ 回到第一行"
+        );
+
+        // 两端夹住：越界按键不许 panic，也不许改变选中。
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowUp));
+        assert_eq!(app.selected.as_deref(), Some(first.as_str()));
+    }
+
+    /// → 展开目录、← 折叠；Enter 在目录行上等价于双击（切换展开）。
+    #[test]
+    fn arrows_and_enter_drive_directories() {
+        let temp = TempDir::new("nav-dir");
+        let mut app = App::with_paths(temp.paths());
+
+        send(&mut app, Message::NewDirectory);
+        let dir_id = app.selected.clone().expect("新建目录后应处于选中态");
+        send(&mut app, Message::NewSession(SessionKind::Ssh));
+        fill(&mut app, "Db-01", "10.20.2.11", "22", "ops");
+        send(&mut app, Message::ApplyDraft);
+        let session_id = app.selected.clone().expect("目录里的连接也应选中");
+
+        // 往目录里建连接会自动展开目录（`push_node`：新建的连接必须立刻可见），
+        // 所以这里先按 ← 折叠，再验证 → / Enter 的切换语义。
+        assert_eq!(app.rows.len(), 2, "建完连接后目录是展开的");
+        send(&mut app, Message::SelectNode(dir_id.clone()));
+        assert_eq!(app.selected.as_deref(), Some(dir_id.as_str()));
+
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowLeft));
+        assert_eq!(app.rows.len(), 1, "← 应折叠目录");
+
+        // 已在目标状态时再按同向键不许有副作用。
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowLeft));
+        assert_eq!(app.rows.len(), 1);
+
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowRight));
+        assert_eq!(app.rows.len(), 2, "→ 应展开目录");
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(dir_id.as_str()),
+            "展开不移动选中"
+        );
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowRight));
+        assert_eq!(app.rows.len(), 2);
+
+        send(&mut app, arrow(iced::keyboard::key::Named::Enter));
+        assert_eq!(app.rows.len(), 1, "Enter 在目录行上应切换展开");
+
+        send(&mut app, arrow(iced::keyboard::key::Named::Enter));
+        assert_eq!(app.rows.len(), 2);
+
+        // 展开后 ↓ 进到子行，Enter 在**连接行**上走「打开」。
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowDown));
+        assert_eq!(app.selected.as_deref(), Some(session_id.as_str()));
+        send(&mut app, arrow(iced::keyboard::key::Named::Enter));
+        assert_eq!(app.tabs.len(), 1, "连接行上的 Enter 应等价于「打开」");
+        assert!(!app.show_home, "打开后停在会话页");
+    }
+
+    /// Delete 走右键「删除」的同一条路径；终端页上的方向键不属于导航。
+    #[test]
+    fn delete_via_keyboard_and_the_terminal_screen_keeps_arrows() {
+        let temp = TempDir::new("nav-delete");
+        let mut app = App::with_paths(temp.paths());
+
+        send(&mut app, Message::NewSession(SessionKind::Ssh));
+        fill(&mut app, "Web-01", "10.20.1.11", "22", "ops");
+        send(&mut app, Message::ApplyDraft);
+
+        send(&mut app, arrow(iced::keyboard::key::Named::Delete));
+        assert_eq!(
+            app.tree().unwrap().session_count(),
+            0,
+            "Delete 应删除选中行"
+        );
+        assert_eq!(app.selected, None);
+
+        // 会话页（show_home=false）上的方向键属于远端 shell，不许挪树。
+        send(&mut app, Message::NewSession(SessionKind::Ssh));
+        fill(&mut app, "Web-02", "10.20.1.12", "22", "ops");
+        send(&mut app, Message::ApplyDraft);
+        let second = app.selected.clone().expect("重建后应处于选中态");
+        send(
+            &mut app,
+            Message::TreeAction(TreeAction::Open(second.clone())),
+        );
+        assert!(!app.show_home, "应停在会话页");
+
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowUp));
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(second.as_str()),
+            "会话页上的 ↑ 不属于导航"
+        );
+    }
+
+    /// 列表页的 ↑↓ 沿先序移动选中、停在列表页；Enter 走「打开」。
+    #[test]
+    fn the_list_page_navigates_by_keyboard() {
+        let temp = TempDir::new("nav-list");
+        let mut app = App::with_paths(temp.paths());
+
+        for host in ["10.20.1.11", "10.20.1.12"] {
+            send(&mut app, Message::NewSession(SessionKind::Ssh));
+            fill(&mut app, "Web", host, "22", "ops");
+            send(&mut app, Message::ApplyDraft);
+        }
+        let ids = app.tree().unwrap().session_ids(&app.search);
+        assert_eq!(ids.len(), 2);
+
+        send(&mut app, Message::ShowList);
+        app.selected = None;
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowDown));
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(ids[0].as_str()),
+            "↓ 从第一条开始"
+        );
+        assert_eq!(app.screen, Screen::List, "导航不许跳页");
+
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowDown));
+        assert_eq!(app.selected.as_deref(), Some(ids[1].as_str()));
+
+        send(&mut app, arrow(iced::keyboard::key::Named::ArrowUp));
+        assert_eq!(app.selected.as_deref(), Some(ids[0].as_str()));
+
+        send(&mut app, arrow(iced::keyboard::key::Named::Enter));
+        assert_eq!(app.tabs.len(), 1, "列表页 Enter 等价于「打开」");
+        assert_eq!(app.screen, Screen::Remote, "打开要把 screen 摘出来");
     }
 
     /// 树行的左键单击只选中、连点两次直接打开。Iced 的 `button` 只有

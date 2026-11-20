@@ -75,7 +75,55 @@ pub enum NetEvent {
     Ready,
     /// 子进程或 socket 已断开。
     Exited(Option<i32>),
-    Error(String),
+    /// 连接层失败。带 [`NetError`] 而不是裸字符串：界面按 `error_kind()` 追加
+    /// 「端口没开 / 名字解析不了」这类可操作建议。
+    Error(NetError),
+}
+
+/// 待处理事件的上限。
+///
+/// 界面卡住（模态缩放循环、跨进程同步调用）时工作线程还在产出，不封顶内存
+/// 会被 `cat /dev/urandom` 这类流量吃穿。按 16ms 一轮、1ms 忙轮询、每轮
+/// 一到两个事件估算，1024 ≈ 若干秒的积压余量，够容纳一次正常的界面停顿。
+const MAX_PENDING_EVENTS: usize = 1024;
+
+/// 连接层 → 界面的事件队列。封顶见 [`MAX_PENDING_EVENTS`]。
+#[derive(Default)]
+pub(crate) struct EventQueue {
+    events: Vec<(ConnId, NetEvent)>,
+    /// 顶到上限后立起，界面 `drain` 时取走并给出一条提示。
+    overflowed: bool,
+}
+
+/// 把一个事件送进队列。ssh 与 telnet 共用这一份（含封顶与锁中毒恢复），
+/// 两边各写一份迟早会漂移出两种行为。
+pub(crate) fn push_event(events: &Arc<Mutex<EventQueue>>, id: ConnId, event: NetEvent) {
+    // 锁中毒说明某个线程持锁时 panic 过；事件队列本身没有需要维持的不变量，
+    // 取回内部值继续用，比静默丢事件（界面永远等不到回显）好得多。
+    let mut guard = events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if guard.events.len() >= MAX_PENDING_EVENTS {
+        // 顶到上限这一刻就已经在丢东西了：挤掉最老的数据换控制事件入队
+        // 同样是一次真实的丢弃，标志必须立起来，界面才能解释画面里的缺口。
+        guard.overflowed = true;
+        // 数据丢了只花画面；控制事件（Ready / Exited / Error）丢了会卡住
+        // 状态机——挤掉最老的一个数据事件也要把控制事件送进去。
+        if !matches!(event, NetEvent::Data(_)) {
+            if let Some(index) = guard
+                .events
+                .iter()
+                .position(|(_, pending)| matches!(pending, NetEvent::Data(_)))
+            {
+                guard.events.remove(index);
+                guard.events.push((id, event));
+            }
+        }
+        return;
+    }
+
+    guard.events.push((id, event));
 }
 
 #[derive(Debug)]
@@ -90,7 +138,7 @@ pub(crate) enum Command {
 pub struct Hub {
     next: ConnId,
     senders: HashMap<ConnId, Sender<Command>>,
-    events: Arc<Mutex<Vec<(ConnId, NetEvent)>>>,
+    events: Arc<Mutex<EventQueue>>,
 }
 
 impl Hub {
@@ -155,7 +203,17 @@ impl Hub {
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *guard)
+        std::mem::take(&mut guard.events)
+    }
+
+    /// 队列是否顶到过上限（读后即清）。调用方在 `drain` 之后查一次，
+    /// 有就给出「中间一段输出被丢弃」的提示。
+    pub fn take_overflowed(&self) -> bool {
+        let mut guard = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut guard.overflowed, false)
     }
 
     pub fn len(&self) -> usize {
@@ -328,5 +386,53 @@ mod tests {
         hub.resize(999, 80, 24);
         hub.close(999);
         assert!(hub.is_empty());
+    }
+
+    /// 队列封顶：数据事件被丢并立起标志；控制事件（Exited/Error/Ready）
+    /// 即使满了也要挤掉最老的数据送进去——丢数据只花画面，丢控制事件会
+    /// 把状态机卡在「连接中」。
+    #[test]
+    fn a_full_queue_drops_data_but_never_control_events() {
+        let events: Arc<Mutex<EventQueue>> = Arc::default();
+
+        for _ in 0..MAX_PENDING_EVENTS {
+            push_event(&events, 1, NetEvent::Data(vec![b'x']));
+        }
+
+        // 顶到上限：再来的数据被丢，标志立起。
+        push_event(&events, 1, NetEvent::Data(vec![b'y']));
+        {
+            let queue = events.lock().unwrap();
+            assert_eq!(queue.events.len(), MAX_PENDING_EVENTS, "数据事件不应入队");
+            assert!(queue.overflowed, "丢弃必须留下标志供界面提示");
+        }
+
+        // 控制事件挤掉最老的数据换进来，而不是被丢——但挤掉**也是一次
+        // 真实的丢弃**，标志必须已经立着（长停顿后最常见的就是 Exited 紧跟
+        // 着积压，用户需要知道画面缺了一段）。
+        push_event(&events, 1, NetEvent::Exited(Some(0)));
+        {
+            let queue = events.lock().unwrap();
+            assert_eq!(
+                queue.events.len(),
+                MAX_PENDING_EVENTS,
+                "Exited 应挤掉一个数据事件入队"
+            );
+            assert!(
+                matches!(queue.events.last(), Some((1, NetEvent::Exited(Some(0))))),
+                "挤进来的必须是刚送的控制事件"
+            );
+            assert!(
+                queue
+                    .events
+                    .iter()
+                    .any(|(_, event)| matches!(event, NetEvent::Data(_))),
+                "被挤掉的应只是最老的数据，其余数据仍在队列里"
+            );
+            assert!(
+                queue.overflowed,
+                "挤掉数据换控制事件入队同样丢了内容，标志不该被清掉"
+            );
+        }
     }
 }

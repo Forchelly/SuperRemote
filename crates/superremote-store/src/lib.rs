@@ -49,6 +49,40 @@ pub struct Opened {
     pub notices: Vec<Notice>,
 }
 
+/// 一个数据文件「本进程最后一次见到它」时的指纹（修改时间 + 长度）。
+///
+/// `save` 写前核对：磁盘上的文件与指纹不一致说明有别的程序（另一个实例、
+/// 编辑器、备份恢复）在动它，盲写会把对方的改动整个冲掉，因此拒绝保存。
+/// 文件缺失不算冲突——那等价于「外部删了它」，重建是被允许的。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct FileStamps {
+    config: Option<(std::time::SystemTime, u64)>,
+    secrets: Option<(std::time::SystemTime, u64)>,
+}
+
+impl FileStamps {
+    fn from_disk(paths: &DataPaths) -> Self {
+        Self {
+            config: stamp_of(&paths.config()),
+            secrets: stamp_of(&paths.secrets()),
+        }
+    }
+}
+
+fn stamp_of(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// 磁盘上的文件是否偏离了本进程最后一次见到的样子。
+/// 记录缺失（启动时文件就不在）时只认「文件出现了」为正常——外部删掉不算冲突。
+fn external_changed(path: &Path, last: Option<(std::time::SystemTime, u64)>) -> bool {
+    match (last, stamp_of(path)) {
+        (Some(last), Some(current)) => last != current,
+        _ => false,
+    }
+}
+
 pub struct Store {
     paths: DataPaths,
     doc: ConfigDoc,
@@ -56,6 +90,7 @@ pub struct Store {
     secrets: SecretStore,
     key: DataKey,
     config_dirty: bool,
+    stamps: FileStamps,
     id_prefix: String,
     id_seq: AtomicU64,
 }
@@ -127,12 +162,16 @@ impl Store {
         };
 
         let tree = doc.to_tree();
+        // 启动时记下两个文件的现状；此后只信自己的写入，磁盘上再有变化就是
+        // 外部修改，save 会拒绝盲写覆盖。
+        let stamps = FileStamps::from_disk(&paths);
         Ok(Store {
             id_prefix: random_bytes(4)
                 .map(|bytes| hex::encode(&bytes))
                 .unwrap_or_default(),
             id_seq: AtomicU64::new(0),
             config_dirty,
+            stamps,
             paths,
             doc,
             tree,
@@ -157,6 +196,9 @@ impl Store {
         self.paths = paths.clone();
         self.secrets.set_path(paths.secrets());
         self.config_dirty = true;
+        // 新目录里的文件是调用方刚复制的，不是外部修改：按现状重置指纹，
+        // 否则下面这轮 save 的核对会把「刚复制过来的文件」当成冲突拒掉。
+        self.stamps = FileStamps::from_disk(&self.paths);
 
         if let Err(err) = self.save() {
             self.paths = old.clone();
@@ -311,15 +353,34 @@ impl Store {
     }
 
     /// 原子写：临时文件 + 改名覆盖。两个文件各自独立提交。
+    ///
+    /// 写前核对指纹：磁盘上的文件与本进程最后一次见到的不一致（另一个实例、
+    /// 编辑器或备份恢复动过它）时拒绝保存，避免盲写覆盖对方的改动；文件
+    /// 缺失不算冲突，按「允许重建」处理。只核对**这次真的要写**的文件——
+    /// 干净时的 save 是空操作，不该因为外部改动而报错挡住目录切换这类流程。
     pub fn save(&mut self) -> Result<(), StoreError> {
+        if self.config_dirty && external_changed(&self.paths.config(), self.stamps.config) {
+            return Err(StoreError::ExternalModified(CONFIG_FILE.into()));
+        }
+        if self.secrets.is_dirty() && external_changed(&self.paths.secrets(), self.stamps.secrets) {
+            return Err(StoreError::ExternalModified(SECRETS_FILE.into()));
+        }
+
         if self.config_dirty {
             self.doc = self.doc.with_tree(&self.tree);
             let text = self.doc.render()?;
             paths::write_atomic(&self.paths.config(), text.as_bytes())?;
             self.config_dirty = false;
+            // 自己写的文件指纹立刻跟上：后半程 secrets 失败时，下一轮 save
+            // 不能把这次由本进程写入的 config 误判成外部改动。
+            self.stamps.config = stamp_of(&self.paths.config());
         }
 
+        let wrote_secrets = self.secrets.is_dirty();
         self.secrets.save()?;
+        if wrote_secrets {
+            self.stamps.secrets = stamp_of(&self.paths.secrets());
+        }
         Ok(())
     }
 }
@@ -449,6 +510,47 @@ mod tests {
         assert_eq!(
             reopened.password("web-01").unwrap().as_deref(),
             Some("s3cr3t")
+        );
+    }
+
+    #[test]
+    fn an_externally_modified_config_refuses_to_save_and_keeps_disk_intact() {
+        let temp = TempDir::new("external-modified");
+        let mut store = Store::open(temp.paths(), None).unwrap().store;
+        store.tree_mut().roots = vec![session("ours")];
+        store.save().unwrap();
+
+        // 外部程序（另一个实例 / 编辑器 / 备份恢复）改写了 config.toml。
+        let external = "# 外部写入\n";
+        std::fs::write(temp.paths().config(), external).unwrap();
+
+        store.tree_mut().roots = vec![session("ours"), session("new-one")];
+        let err = store.save().unwrap_err();
+        assert!(
+            matches!(err, StoreError::ExternalModified(_)),
+            "应为外部修改冲突，实际是 {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.paths().config()).unwrap(),
+            external,
+            "外部写入必须原样留在盘上"
+        );
+    }
+
+    #[test]
+    fn a_clean_store_saves_fine_even_when_the_disk_file_changed() {
+        let temp = TempDir::new("external-clean");
+        let mut store = Store::open(temp.paths(), None).unwrap().store;
+        store.tree_mut().roots = vec![session("ours")];
+        store.save().unwrap();
+
+        // 外部改写后本进程没有待保存的内容：save 是空操作，不该报冲突
+        // 挡住「目录切换前先落盘」这类流程。
+        std::fs::write(temp.paths().config(), "# 外部写入\n").unwrap();
+        store.save().unwrap();
+        assert!(
+            !store.tree_mut().roots.is_empty(),
+            "内存里的树不受影响，改动的丢失风险只在于不再落盘"
         );
     }
 

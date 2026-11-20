@@ -97,10 +97,35 @@ impl App {
             })
     }
 
+    /// 一个运行实例现在是否真的画在某个窗口里。
+    ///
+    /// 主窗口只有**活动标签**看得见；独立窗口整个窗口就是那一路会话，开着即可见。
+    /// `pump_network` 按它决定要不要物化 Frame：后台标签只喂网格，省掉每 16ms
+    /// 一次的整屏分配（见 `Terminal::feed_background`）。
+    pub(super) fn is_instance_visible(&self, instance: TabId) -> bool {
+        if self.active_terminal_instance() == Some(instance) {
+            return true;
+        }
+        self.windows
+            .values()
+            .any(|slot| matches!(slot, WindowSlot::Detached(tab) if tab.instance == instance))
+    }
+
     pub(super) fn cycle_tab(&mut self, delta: isize) -> Task<Message> {
         match self.tabs.activate_offset(delta) {
             Some(index) => self.update(Message::ActivateTab(index)),
             None => Task::none(),
+        }
+    }
+
+    /// 把当前活动标签积压的帧补上：后台标签只喂网格不物化
+    /// （`Terminal::feed_background`），切到它面前那一刻补一次，
+    /// 否则用户看到的是冻结的旧画面，直到下一批数据才恢复。
+    pub(super) fn refresh_active_frame(&mut self) {
+        if let Some(instance) = self.active_terminal_instance() {
+            if let Some(terminal) = self.terminals.get_mut(&instance) {
+                terminal.refresh_frame();
+            }
         }
     }
 }

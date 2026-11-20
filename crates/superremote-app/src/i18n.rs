@@ -177,6 +177,53 @@ impl Lang {
         }
     }
 
+    /// 保存被拒：磁盘上的数据文件被外部程序改过，拒绝盲写覆盖。
+    /// 不带错误细节——用户需要的不是 io 原因，是「没保存 + 该怎么办」。
+    pub fn data_file_changed(self) -> &'static str {
+        match self {
+            Self::Zh => "数据文件已被外部程序修改，本次未保存。请核对文件后重启 SuperRemote。",
+            Self::En => {
+                "Data files were changed by another program; nothing was saved. \
+                 Check the files and restart SuperRemote."
+            }
+        }
+    }
+
+    /// 事件队列顶到上限后，画面里缺的那一段输出的解释。
+    pub fn net_overflow(self) -> &'static str {
+        match self {
+            Self::Zh => "连接输出过快，中间一段内容被丢弃",
+            Self::En => "Output arrived too fast and a stretch of it was dropped",
+        }
+    }
+
+    /// 连接失败的「下一步该查什么」。`None` = 这个分类没有可给的建议。
+    ///
+    /// 只覆盖最常见的几类；其余错误原文已经带着上下文，硬给建议反而是误导。
+    /// （DNS 失败在 Windows 上没有稳定的 `ErrorKind` 分类可认，原文里的
+    /// 「无法解析地址」本身已经够指向性了。）
+    pub fn net_error_hint(self, kind: std::io::ErrorKind) -> Option<&'static str> {
+        match kind {
+            std::io::ErrorKind::ConnectionRefused => match self {
+                Self::Zh => Some("目标拒绝连接：端口没开或服务未启动"),
+                Self::En => {
+                    Some("Connection refused: the port is closed or the service is not running")
+                }
+            },
+            std::io::ErrorKind::TimedOut => match self {
+                Self::Zh => Some("连接超时：网络不可达或被防火墙丢弃"),
+                Self::En => {
+                    Some("Timed out: the host is unreachable or a firewall dropped the packet")
+                }
+            },
+            std::io::ErrorKind::PermissionDenied => match self {
+                Self::Zh => Some("权限被拒绝：本机策略或凭据不允许这次连接"),
+                Self::En => Some("Permission denied: local policy or credentials forbid this"),
+            },
+            _ => None,
+        }
+    }
+
     pub fn data_dir_change_failed(self, err: &str) -> String {
         match self {
             Self::Zh => format!("无法更改数据目录：{err}"),

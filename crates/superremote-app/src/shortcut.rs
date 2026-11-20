@@ -32,6 +32,28 @@ pub enum Shortcut {
     CloseTab,
 }
 
+/// 树 / 连接列表页的导航键。
+///
+/// 与 `Shortcut` 同一层只翻译不碰状态。认领范围由调用方决定：只有画面里
+/// **没有终端**的页面（主页、连接列表）才轮到它，终端页里的裸方向键属于远端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nav {
+    /// `↑`
+    Up,
+    /// `↓`
+    Down,
+    /// `Enter`：树上的连接 = 打开、目录 = 展开折叠；列表页 = 打开
+    Open,
+    /// `→`：展开目录
+    Expand,
+    /// `←`：折叠目录
+    Collapse,
+    /// `F2`
+    Rename,
+    /// `Delete`
+    Delete,
+}
+
 /// 解析一次按键。返回 `None` 表示「界面不认领」，调用方交给终端。
 pub fn resolve(event: &Event) -> Option<Shortcut> {
     let Event::KeyPressed { key, modifiers, .. } = event else {
@@ -49,6 +71,36 @@ pub fn resolve(event: &Event) -> Option<Shortcut> {
             Shortcut::NextTab
         }),
         Key::Character(value) => resolve_character(value, *modifiers),
+        _ => None,
+    }
+}
+
+/// 解析一次**不带修饰键**的按键是否属于树/列表导航。
+///
+/// 带修饰键的组合一律不认领：`Ctrl` 系已经归 [`resolve`]，`Shift`/`Alt` 系
+/// （终端里的转义用法、未来的自定义快捷键）不该被导航抢走。
+pub fn resolve_nav(event: &Event) -> Option<Nav> {
+    let Event::KeyPressed {
+        key: Key::Named(named),
+        modifiers,
+        ..
+    } = event
+    else {
+        return None;
+    };
+
+    if !modifiers.is_empty() {
+        return None;
+    }
+
+    match named {
+        key::Named::ArrowUp => Some(Nav::Up),
+        key::Named::ArrowDown => Some(Nav::Down),
+        key::Named::Enter => Some(Nav::Open),
+        key::Named::ArrowRight => Some(Nav::Expand),
+        key::Named::ArrowLeft => Some(Nav::Collapse),
+        key::Named::F2 => Some(Nav::Rename),
+        key::Named::Delete => Some(Nav::Delete),
         _ => None,
     }
 }
@@ -171,6 +223,58 @@ mod tests {
                 physical_key: key::Physical::Code(key::Code::Digit1),
                 location: iced::keyboard::Location::Standard,
                 modifiers: Modifiers::CTRL,
+            }),
+            None,
+            "抬起事件不该再触发动作"
+        );
+    }
+
+    #[test]
+    fn bare_arrows_enter_f2_and_delete_navigate_the_tree() {
+        for (named, nav) in [
+            (key::Named::ArrowUp, Nav::Up),
+            (key::Named::ArrowDown, Nav::Down),
+            (key::Named::Enter, Nav::Open),
+            (key::Named::ArrowRight, Nav::Expand),
+            (key::Named::ArrowLeft, Nav::Collapse),
+            (key::Named::F2, Nav::Rename),
+            (key::Named::Delete, Nav::Delete),
+        ] {
+            assert_eq!(
+                resolve_nav(&press(Key::Named(named), Modifiers::NONE)),
+                Some(nav),
+                "裸 {named:?} 应翻译为 {nav:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modified_keys_and_releases_never_navigate() {
+        for modifiers in [
+            Modifiers::CTRL,
+            Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers::CTRL | Modifiers::SHIFT,
+        ] {
+            assert_eq!(
+                resolve_nav(&press(Key::Named(key::Named::ArrowUp), modifiers)),
+                None,
+                "带修饰键的方向键属于终端或全局快捷键，不是导航"
+            );
+        }
+
+        // 普通字母、松开事件都不属于导航。
+        assert_eq!(
+            resolve_nav(&press(Key::Character("j".into()), Modifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            resolve_nav(&Event::KeyReleased {
+                key: Key::Named(key::Named::Enter),
+                modified_key: Key::Named(key::Named::Enter),
+                physical_key: key::Physical::Code(key::Code::Enter),
+                location: iced::keyboard::Location::Standard,
+                modifiers: Modifiers::NONE,
             }),
             None,
             "抬起事件不该再触发动作"

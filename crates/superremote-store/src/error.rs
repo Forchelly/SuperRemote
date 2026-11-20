@@ -37,6 +37,11 @@ pub enum StoreError {
 
     #[error("目标数据目录里已有数据文件：{0}")]
     DataDirOccupied(String),
+
+    /// 磁盘上的数据文件与本进程最后一次见到的不一致（另一个实例、编辑器或
+    /// 备份恢复动过它）。保存被拒绝以避免盲写覆盖对方的改动。
+    #[error("数据文件已被外部程序修改：{0}")]
+    ExternalModified(String),
 }
 
 impl StoreError {

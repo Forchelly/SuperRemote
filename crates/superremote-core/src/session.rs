@@ -923,9 +923,20 @@ impl Session {
         format!("{}:{}", self.host, self.port)
     }
 
-    /// 搜索命中：连接名或主机名包含关键字（大小写不敏感）。
+    /// 搜索命中：连接名、主机名、地址或用户名包含关键字（大小写不敏感）。
+    ///
+    /// 这是**唯一**一份搜索口径：树侧栏与连接列表共用。列表页原先自带的
+    /// 一份（多了地址与用户名）已经收编到这里——两套口径会让「树里搜不到、
+    /// 列表里搜得到」这种错位悄悄出现。
     pub fn matches(&self, needle: &str) -> bool {
-        self.name.to_lowercase().contains(needle) || self.host.to_lowercase().contains(needle)
+        let name = self.name.to_lowercase().contains(needle);
+        let host = self.host.to_lowercase().contains(needle);
+        let address = self.address().to_lowercase().contains(needle);
+        let user = self
+            .username
+            .as_deref()
+            .is_some_and(|user| user.to_lowercase().contains(needle));
+        name || host || address || user
     }
 }
 
@@ -981,6 +992,15 @@ pub enum TreeRow {
         address: String,
         depth: usize,
     },
+}
+
+impl TreeRow {
+    /// 行对应的节点 id。键盘导航按行移动选中，两种行共用这一条。
+    pub fn id(&self) -> &SessionId {
+        match self {
+            Self::Directory { id, .. } | Self::Session { id, .. } => id,
+        }
+    }
 }
 
 /// 节点移动的目的地。拖拽落到不同的行上，语义不一样。
@@ -1414,6 +1434,33 @@ impl SessionTree {
         }
 
         out
+    }
+
+    /// 先序平铺**全部**连接的 id，忽略目录展开状态；`query` 语义与 [`rows`] 一致。
+    ///
+    /// 连接列表页（`ui::list`）显示的就是这个顺序，键盘导航按同一顺序移动选中，
+    /// 保证「按 ↓ 选中的」永远是「画面上看得见的那一行」。
+    pub fn session_ids(&self, query: &str) -> Vec<SessionId> {
+        let needle = query.trim().to_lowercase();
+        let mut out = Vec::new();
+        collect_session_ids(&self.roots, &needle, &mut out);
+        out
+    }
+}
+
+/// `session_ids` 的先序遍历：目录名不参与（列表页本来就不显示目录）。
+fn collect_session_ids(nodes: &[SessionNode], needle: &str, out: &mut Vec<SessionId>) {
+    for node in nodes {
+        match node {
+            SessionNode::Directory(directory) => {
+                collect_session_ids(&directory.children, needle, out);
+            }
+            SessionNode::Session(session) => {
+                if needle.is_empty() || session.matches(needle) {
+                    out.push(session.id.clone());
+                }
+            }
+        }
     }
 }
 

@@ -15,7 +15,8 @@ use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 
 use crate::error::NetError;
-use crate::{Command, ConnId, NetEvent, Target};
+use crate::push_event;
+use crate::{Command, ConnId, EventQueue, NetEvent, Target};
 
 /// 数据到达时的读取缓冲。
 const READ_BUFFER: usize = 16 * 1024;
@@ -50,7 +51,7 @@ pub fn spawn(
     target: &Target,
     cols: u16,
     rows: u16,
-    events: Arc<Mutex<Vec<(ConnId, NetEvent)>>>,
+    events: Arc<Mutex<EventQueue>>,
     commands: Receiver<Command>,
 ) -> Result<thread::JoinHandle<()>, NetError> {
     if ssh_client().is_none() {
@@ -84,7 +85,10 @@ pub fn spawn(
             if let Some(path) = &key_path {
                 discard_private_key(path);
             }
-            return Err(NetError::Io(err.to_string()));
+            return Err(NetError::Io {
+                kind: err.kind(),
+                message: err.to_string(),
+            });
         }
     };
     let password = target.password.clone();
@@ -104,11 +108,16 @@ fn write_private_key(id: ConnId, key: &str) -> Result<PathBuf, NetError> {
     // 目录名沿用旧产品名：里面可能还有上次异常退出留下的私钥，
     // 换名字会让清理逻辑扫不到它们（见 `rdp::clean_stale_temp_files`）。
     let dir = std::env::temp_dir().join("SimpleRemote2");
-    std::fs::create_dir_all(&dir)
-        .map_err(|err| NetError::Io(format!("无法创建私钥临时目录：{err}")))?;
+    std::fs::create_dir_all(&dir).map_err(|err| NetError::Io {
+        kind: err.kind(),
+        message: format!("无法创建私钥临时目录：{err}"),
+    })?;
 
     let path = dir.join(format!("ssh-key-{id}-{}", unique_suffix()));
-    std::fs::write(&path, key).map_err(|err| NetError::Io(format!("无法写入临时私钥：{err}")))?;
+    std::fs::write(&path, key).map_err(|err| NetError::Io {
+        kind: err.kind(),
+        message: format!("无法写入临时私钥：{err}"),
+    })?;
 
     Ok(path)
 }
@@ -170,7 +179,7 @@ fn run(
     id: ConnId,
     mut pty: tty::Pty,
     password: Option<String>,
-    events: Arc<Mutex<Vec<(ConnId, NetEvent)>>>,
+    events: Arc<Mutex<EventQueue>>,
     commands: Receiver<Command>,
     key_path: Option<PathBuf>,
 ) {
@@ -186,7 +195,7 @@ fn run(
             match command {
                 Command::Input(bytes) => {
                     if let Err(err) = write_session(&mut pty, &bytes) {
-                        push(&events, id, NetEvent::Error(err));
+                        push_event(&events, id, NetEvent::Error(NetError::Other(err)));
                     }
                 }
                 Command::Resize(cols, rows) => pty.on_resize(WindowSize {
@@ -203,7 +212,7 @@ fn run(
         if read > 0 {
             had_data = true;
             let chunk = buffer[..read].to_vec();
-            push(&events, id, NetEvent::Data(chunk.clone()));
+            push_event(&events, id, NetEvent::Data(chunk.clone()));
 
             if !authenticated {
                 recent.extend_from_slice(&chunk);
@@ -222,7 +231,7 @@ fn run(
                             if let Err(err) =
                                 write_session(&mut pty, format!("{password}\r").as_bytes())
                             {
-                                push(&events, id, NetEvent::Error(err));
+                                push_event(&events, id, NetEvent::Error(NetError::Other(err)));
                             }
                         }
                     }
@@ -234,7 +243,7 @@ fn run(
                 } else if text.contains("(yes/no") {
                     // 老版本 ssh 或被已知主机冲突挡住时，代为确认一次。
                     if let Err(err) = write_session(&mut pty, b"yes\r") {
-                        push(&events, id, NetEvent::Error(err));
+                        push_event(&events, id, NetEvent::Error(NetError::Other(err)));
                     }
                     recent.clear();
                 }
@@ -243,7 +252,7 @@ fn run(
 
         if let Some(ChildEvent::Exited(code)) = pty.next_child_event() {
             let status = code.and_then(|status| status.code());
-            push(&events, id, NetEvent::Exited(status));
+            push_event(&events, id, NetEvent::Exited(status));
             break;
         }
 
@@ -292,15 +301,6 @@ fn write_session(pty: &mut tty::Pty, bytes: &[u8]) -> Result<(), String> {
     pty.writer()
         .flush()
         .map_err(|err| format!("刷新会话输出失败：{err}"))
-}
-
-fn push(events: &Arc<Mutex<Vec<(ConnId, NetEvent)>>>, id: ConnId, event: NetEvent) {
-    // 锁中毒说明某个线程持锁时 panic 过；事件队列本身没有需要维持的不变量，
-    // 取回内部值继续用，比静默丢事件（界面永远等不到回显）好得多。
-    let mut guard = events
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.push((id, event));
 }
 
 #[cfg(test)]

@@ -1793,14 +1793,16 @@ mod sizing {
             static SINK: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
             SINK.get_or_init(|| {
-                // 本轮取证默认打开：写到 `%TEMP%\superremote-frame.log`，
-                // `SUPERREMOTE_FRAME_LOG` 可以改路径。
-                let path = std::env::var_os("SUPERREMOTE_FRAME_LOG")
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        std::env::var_os("TEMP")
-                            .map(|dir| PathBuf::from(dir).join("superremote-frame.log"))
-                    })?;
+                // 默认关闭：这是拖边期逐帧日志，不该在正常运行里常驻写盘。
+                // 取证时设 `SUPERREMOTE_FRAME_LOG=<路径>`，值为 `1` 时写
+                // `%TEMP%\superremote-frame.log`。
+                let value = std::env::var_os("SUPERREMOTE_FRAME_LOG")?;
+                let path = if value == *"1" {
+                    std::env::var_os("TEMP")
+                        .map(|dir| PathBuf::from(dir).join("superremote-frame.log"))?
+                } else {
+                    PathBuf::from(value)
+                };
 
                 OpenOptions::new()
                     .create(true)

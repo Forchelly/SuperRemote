@@ -322,7 +322,8 @@ fn coalesce(damage: Vec<Rectangle>) -> Vec<Rectangle> {
 ///
 /// 目的：定位拖拽缩放时「亮一下、暗一下」交替闪烁发生在
 /// 「自己画的那一帧」还是「没画、直接 present 的那一帧」。
-/// 路径：`SR2_FRAME_LOG` 指定；未指定时写到 `%TEMP%\sr2-frame.log`。
+/// 默认关闭（逐帧写盘曾把日志积到 268MB）：取证时设 `SR2_FRAME_LOG=<路径>`，
+/// 值为 `1` 时写 `%TEMP%\sr2-frame.log`。
 /// 对照实验：设置 `SR2_FULL_REPAINT=1` 后每帧强制整窗重绘。
 /// 定位完成后整块删除（连同 `Surface` 里的三个诊断字段）。
 mod diag {
@@ -336,13 +337,15 @@ mod diag {
         static SINK: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
         SINK.get_or_init(|| {
-            // 本轮取证默认打开：写到 `%TEMP%\sr2-frame.log`，
-            // `SR2_FRAME_LOG` 可以改路径。
-            let path = std::env::var_os("SR2_FRAME_LOG")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("TEMP").map(|dir| PathBuf::from(dir).join("sr2-frame.log"))
-                })?;
+            // 默认关闭：这是逐帧日志，开着时每一帧都要落一次盘，曾把
+            // `%TEMP%\sr2-frame.log` 积到 268MB。取证时设 `SR2_FRAME_LOG=<路径>`，
+            // 值为 `1` 时写 `%TEMP%\sr2-frame.log`。
+            let value = std::env::var_os("SR2_FRAME_LOG")?;
+            let path = if value == *"1" {
+                std::env::var_os("TEMP").map(|dir| PathBuf::from(dir).join("sr2-frame.log"))?
+            } else {
+                PathBuf::from(value)
+            };
 
             OpenOptions::new()
                 .create(true)

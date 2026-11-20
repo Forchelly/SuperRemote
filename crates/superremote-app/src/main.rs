@@ -15,6 +15,13 @@ fn main() -> iced::Result {
         return Ok(());
     }
 
+    // 双开防护：两个实例的自动保存会拿各自的内存快照互相盲写覆盖，后保存的
+    // 冲掉先保存的。第二个实例只弹窗告知并退出；设了 SUPERREMOTE_DATA_DIR 时
+    // 旁路（开发/测试的数据隔离工作流）。
+    if !superremote_win::single_instance::guard() {
+        return Ok(());
+    }
+
     // 必须在创建任何窗口之前设置：mixed-DPI 承载只对之后新建的父窗口生效。
     // 否则 mstsc 子窗口会被 DPI 虚拟化，鼠标划过 RDP 区域会一大一小地跳。
     superremote_win::rdp_host::enable_mixed_dpi_hosting();

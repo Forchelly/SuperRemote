@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::{Command, ConnId, NetEvent, Target};
+use crate::push_event;
+use crate::{Command, ConnId, EventQueue, NetError, NetEvent, Target};
 
 const IAC: u8 = 0xFF;
 const DONT: u8 = 0xFE;
@@ -32,7 +33,7 @@ const BUSY_POLL: Duration = Duration::from_millis(1);
 pub fn spawn(
     id: ConnId,
     target: &Target,
-    events: Arc<Mutex<Vec<(ConnId, NetEvent)>>>,
+    events: Arc<Mutex<EventQueue>>,
     commands: Receiver<Command>,
 ) -> thread::JoinHandle<()> {
     // 只在调用线程里拼地址字符串。真正的 DNS 解析与 TCP 握手放到工作线程：
@@ -44,22 +45,31 @@ pub fn spawn(
         Ok(stream) => run(id, stream, events, commands),
         // 失败只报 `Error`，不再补一个 `Exited`：后者会把状态从「失败」
         // 覆盖成「正常断开」，用户就看不到失败原因了。
-        Err(message) => push(&events, id, NetEvent::Error(message)),
+        Err(err) => push_event(&events, id, NetEvent::Error(err)),
     })
 }
 
-fn connect(address: &str) -> Result<TcpStream, String> {
+/// 建连失败带上 `ErrorKind`：界面层按它给「端口没开 / 名字解析不了」
+/// 这类下一步建议，比一段 OS 原文有用得多。
+fn connect(address: &str) -> Result<TcpStream, NetError> {
     let server = address
         .to_socket_addrs()
-        .map_err(|err| format!("无法解析地址 {address}：{err}"))?
+        .map_err(|err| NetError::Io {
+            kind: err.kind(),
+            message: format!("无法解析地址 {address}：{err}"),
+        })?
         .next()
-        .ok_or_else(|| format!("无法解析地址 {address}"))?;
+        .ok_or_else(|| NetError::Other(format!("无法解析地址 {address}")))?;
 
-    let stream = TcpStream::connect_timeout(&server, CONNECT_TIMEOUT)
-        .map_err(|err| format!("连接 {address} 失败：{err}"))?;
-    stream
-        .set_nonblocking(true)
-        .map_err(|err| format!("无法把连接切到非阻塞模式：{err}"))?;
+    let stream =
+        TcpStream::connect_timeout(&server, CONNECT_TIMEOUT).map_err(|err| NetError::Io {
+            kind: err.kind(),
+            message: format!("连接 {address} 失败：{err}"),
+        })?;
+    stream.set_nonblocking(true).map_err(|err| NetError::Io {
+        kind: err.kind(),
+        message: format!("无法把连接切到非阻塞模式：{err}"),
+    })?;
 
     Ok(stream)
 }
@@ -67,12 +77,12 @@ fn connect(address: &str) -> Result<TcpStream, String> {
 fn run(
     id: ConnId,
     mut stream: TcpStream,
-    events: Arc<Mutex<Vec<(ConnId, NetEvent)>>>,
+    events: Arc<Mutex<EventQueue>>,
     commands: Receiver<Command>,
 ) {
     let mut raw = [0u8; 16 * 1024];
     // Telnet 没有认证阶段，TCP 握手成功即可输入。
-    push(&events, id, NetEvent::Ready);
+    push_event(&events, id, NetEvent::Ready);
 
     'outer: loop {
         let mut had_data = false;
@@ -81,7 +91,11 @@ fn run(
             match command {
                 Command::Input(bytes) => {
                     if stream.write_all(&bytes).is_err() {
-                        push(&events, id, NetEvent::Error("写入会话失败".to_owned()));
+                        push_event(
+                            &events,
+                            id,
+                            NetEvent::Error(NetError::Other("写入会话失败".to_owned())),
+                        );
                     }
                 }
                 Command::Resize(cols, rows) => {
@@ -105,13 +119,20 @@ fn run(
                     let _ = stream.write_all(&reply);
                 }
                 if !text.is_empty() {
-                    push(&events, id, NetEvent::Data(text));
+                    push_event(&events, id, NetEvent::Data(text));
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(err) => {
                 // 读出错就到此为止，只报原因；末尾的 `Exited` 由状态决定是否补发。
-                push(&events, id, NetEvent::Error(err.to_string()));
+                push_event(
+                    &events,
+                    id,
+                    NetEvent::Error(NetError::Io {
+                        kind: err.kind(),
+                        message: err.to_string(),
+                    }),
+                );
                 return;
             }
         }
@@ -119,7 +140,7 @@ fn run(
         thread::sleep(if had_data { BUSY_POLL } else { IDLE_POLL });
     }
 
-    push(&events, id, NetEvent::Exited(Some(0)));
+    push_event(&events, id, NetEvent::Exited(Some(0)));
 }
 
 /// 剥掉协商序列，返回（正文, 应答序列）。
@@ -202,12 +223,6 @@ fn naws(cols: u16, rows: u16) -> Vec<u8> {
         IAC,
         SE,
     ]
-}
-
-fn push(events: &Arc<Mutex<Vec<(ConnId, NetEvent)>>>, id: ConnId, event: NetEvent) {
-    if let Ok(mut guard) = events.lock() {
-        guard.push((id, event));
-    }
 }
 
 #[cfg(test)]

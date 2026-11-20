@@ -105,22 +105,12 @@ fn collect<'a>(nodes: &'a [SessionNode], needle: &str, out: &mut Vec<&'a Session
                 collect(&directory.children, needle, out);
             }
             SessionNode::Session(session) => {
-                if needle.is_empty() || matches(session, needle) {
+                if needle.is_empty() || session.matches(needle) {
                     out.push(session);
                 }
             }
         }
     }
-}
-
-fn matches(session: &Session, needle: &str) -> bool {
-    session.name.to_lowercase().contains(needle)
-        || session.host.to_lowercase().contains(needle)
-        || session.address().to_lowercase().contains(needle)
-        || session
-            .username
-            .as_deref()
-            .is_some_and(|user| user.to_lowercase().contains(needle))
 }
 
 fn row_view<'a>(app: &App, session: &'a Session, available: f32) -> Element<'a, Message> {
@@ -150,7 +140,8 @@ fn row_view<'a>(app: &App, session: &'a Session, available: f32) -> Element<'a, 
     .on_press(Message::SelectNode(id.clone()))
     .width(Fill)
     .padding([9.0, 10.0])
-    .style(theme::tree_row(false, false));
+    // 键盘 ↑↓ 会移动 selected；不给选中态，列表页的导航就是隐形的。
+    .style(theme::tree_row(app.is_selected(&session.id), false));
 
     let open = ui::button::secondary(
         t.menu_open,

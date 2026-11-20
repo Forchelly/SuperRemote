@@ -76,7 +76,14 @@ impl Host {
         self.sessions.set(remaining);
 
         if let Some(control) = self.control() {
-            let _ = rdp_host::send_command(control, &close_payload(session));
+            let payload = close_payload(session);
+            // `WM_COPYDATA` 必须同步等宿主把数据拷走，宿主 GUI 线程卡住（UAC
+            // 蓝底那类场景）时这条调用会把 Iced 主线程一起拖住。关闭命令不需要
+            // 回执：丢到后台线程发；发不出去就当宿主已经死了，由下面的进程
+            // 收尾兜底。`add` 命令仍走同步——它的返回值决定要不要回退起新宿主。
+            let _ = std::thread::spawn(move || {
+                rdp_host::send_command(control, &payload);
+            });
         } else if let Some(window) = window {
             rdp_host::request_close(window);
         }
@@ -167,11 +174,17 @@ fn temp_dir() -> PathBuf {
 
 /// 排查用时序日志：与 C# 宿主的 `rdp-host-<pid>.log` 放同一目录，复现一次即可
 /// 按时间戳对齐。默认开启、2MB 封顶、写失败一律忽略，不做逐帧打点。
+///
+/// 句柄只开一次并常驻：宿主日志按 2 秒心跳与事件打点，旧行为每行 open/close
+/// 一次文件纯属浪费；封顶检查退化为持句柄的一次元数据查询。
 pub(crate) fn trace(line: &str) {
     use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -184,17 +197,27 @@ pub(crate) fn trace(line: &str) {
         local % 60,
         now.subsec_millis()
     );
-    let path = temp_dir().join("rdp-app.log");
-    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_BYTES) {
+
+    let Some(sink) = SINK.get_or_init(|| {
+        let path = temp_dir().join("rdp-app.log");
+        // 首次调用可能早于任何 `.rdp`/私钥落盘：目录自己建，别依赖别人的创建顺序。
+        let _ = std::fs::create_dir_all(temp_dir());
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(Mutex::new)
+    }) else {
+        return;
+    };
+    let Ok(mut file) = sink.lock() else {
+        return;
+    };
+    if file.metadata().is_ok_and(|meta| meta.len() > MAX_BYTES) {
         return;
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{stamp} {line}");
-    }
+    let _ = writeln!(file, "{stamp} {line}");
 }
 
 /// 2 秒一次：证明 Iced 主线程还在跳，并跨进程探活每个 RDP 宿主窗口。

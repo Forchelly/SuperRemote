@@ -201,6 +201,9 @@ pub struct Terminal {
     tail: String,
     /// 非 UTF-8 字符集的**增量**解码器。UTF-8 是 `None`，走 `from_utf8_lossy` 原路。
     transcoder: Option<encoding_rs::Decoder>,
+    /// 后台标签攒下未物化的帧。切回可见时 `refresh_frame` 补上，
+    /// 保证 `view` 读到的永远是当前内容而不是旧帧。
+    frame_stale: bool,
 }
 
 impl Terminal {
@@ -224,17 +227,34 @@ impl Terminal {
             received: 0,
             tail: String::new(),
             transcoder,
+            frame_stale: false,
         }
     }
 
     /// 收到远端字节：按字符集解码、喂网格并刷新帧。
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_bytes(bytes, true);
+    }
+
+    /// 后台标签的喂入：网格照喂（数据不能丢、提示符判定靠累积文本），
+    /// 但跳过整屏 Frame 的物化——四个标签跑 `tail -f` 时，物化只服务渲染，
+    /// 看不见的那几路就是每 16ms 几次纯浪费的全屏分配。
+    pub fn feed_background(&mut self, bytes: &[u8]) {
+        self.feed_bytes(bytes, false);
+    }
+
+    fn feed_bytes(&mut self, bytes: &[u8], materialize: bool) {
         self.received += bytes.len() as u64;
         let text = self.decode_chunk(bytes);
         // 解码结果统一按 UTF-8 再喂给网格：`alacritty_terminal` 的解析器只认 UTF-8，
         // 直接把 GBK 字节丢进去会整片变成替换字符。
         self.grid.feed(text.as_bytes());
-        self.frame = self.grid.frame();
+        if materialize {
+            self.frame = self.grid.frame();
+            self.frame_stale = false;
+        } else {
+            self.frame_stale = true;
+        }
 
         // 连接层只知道「ssh 进程还活着」，认证是否完成只能从提示符看出来。
         // 提示符经常被拆在两次读里，所以要拿累积的尾部一起判断。
@@ -316,6 +336,7 @@ impl Terminal {
         self.grid
             .resize(Size::new(self.cols as usize, self.rows as usize));
         self.frame = self.grid.frame();
+        self.frame_stale = false;
     }
 
     /// 取选择区的文本。宽字符占位格跳过，逐行去掉行尾空白。
@@ -371,6 +392,16 @@ impl Terminal {
     pub fn scroll(&mut self, delta: i32) {
         self.grid.scroll(delta);
         self.frame = self.grid.frame();
+        self.frame_stale = false;
+    }
+
+    /// 后台标签切回可见时补一次物化。没有积压就是空操作，所以调用方不必
+    /// 判断「刚才它是不是后台」——每次激活都调一遍最省心。
+    pub fn refresh_frame(&mut self) {
+        if self.frame_stale {
+            self.frame = self.grid.frame();
+            self.frame_stale = false;
+        }
     }
 }
 
@@ -862,5 +893,67 @@ mod tests {
 
         terminal.status = Status::Closed(Some(0));
         assert!(!terminal.accepts_input());
+    }
+
+    /// 后台标签只喂网格不物化帧；切回可见那一刻 `refresh_frame` 补上。
+    /// 这条契约钉住 `pump_network` 的可见性优化：漏掉任何一处补帧，
+    /// 用户切标签就会看到冻结的旧画面。
+    #[test]
+    fn background_feeds_skip_materialization_until_the_tab_is_visible() {
+        let mut terminal = Terminal::new(60, 20, test_settings());
+        terminal.feed(b"before");
+        let before = terminal.screen_text();
+
+        terminal.feed_background(b"background output");
+        assert_eq!(terminal.screen_text(), before, "后台喂入不该改变可见帧");
+        assert!(terminal.frame_stale);
+
+        // 状态机照走：字节数照计（流量统计），提示符判定也不依赖帧。
+        assert_eq!(
+            terminal.received as usize,
+            b"before".len() + b"background output".len()
+        );
+
+        terminal.refresh_frame();
+        assert!(
+            terminal.screen_text().contains("background output"),
+            "切回可见必须补一次物化"
+        );
+        assert!(!terminal.frame_stale);
+
+        // 没有积压时 refresh_frame 是空操作——激活路径每次都调它。
+        terminal.refresh_frame();
+        assert!(!terminal.frame_stale);
+    }
+
+    /// 手动基线：`cargo test -p superremote-app background_feed -- --ignored`。
+    /// 打印同一段输出走「含物化 / 跳过物化」两条路各 300 次的耗时；改动
+    /// `feed` 路径前后各跑一次对比数字。断言只钉结构性事实（物化路径做的
+    /// 事是后台路径的严格超集），不钉绝对毫秒——CI 机器快慢没有意义。
+    #[test]
+    #[ignore = "性能基线，手动运行读输出"]
+    fn background_feed_baseline() {
+        let chunk = "some terminal output\r\n".repeat(24).into_bytes();
+
+        let mut terminal = Terminal::new(150, 45, test_settings());
+        let start = std::time::Instant::now();
+        for _ in 0..300 {
+            terminal.feed_background(&chunk);
+        }
+        let background = start.elapsed();
+        assert!(terminal.frame_stale, "后台路径必须真的跳过物化");
+
+        let mut fresh = Terminal::new(150, 45, test_settings());
+        let start = std::time::Instant::now();
+        for _ in 0..300 {
+            fresh.feed(&chunk);
+        }
+        let foreground = start.elapsed();
+
+        println!("300 次 feed（150×45 网格）：后台 {background:?}，含物化 {foreground:?}");
+        assert!(
+            foreground > background,
+            "物化路径包含后台路径的全部工作，不可能更快"
+        );
     }
 }
